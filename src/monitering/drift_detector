@@ -1,0 +1,408 @@
+"""
+drift_detector.py — Statistical Drift Detection Engine
+
+Implements 5 drift detection methods:
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  Method              │ Feature type    │ What it measures            │
+  ├──────────────────────┼─────────────────┼─────────────────────────────┤
+  │  PSI                 │ Numerical       │ Distribution shift magnitude│
+  │  KS Test             │ Numerical       │ Distributional change (p)   │
+  │  Jensen–Shannon Div. │ Both            │ Symmetric divergence        │
+  │  Wasserstein Dist.   │ Numerical       │ Earth-mover distance        │
+  │  Chi-Square Test     │ Categorical     │ Category frequency shift    │
+  └──────────────────────┴─────────────────┴─────────────────────────────┘
+
+Each feature gets a DriftResult with: score, p_value, severity, method.
+Aggregation produces a BatchDriftReport with an overall drift score.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+from scipy import stats
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import ks_2samp, chi2_contingency, wasserstein_distance
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+
+from src.config import drift_config, model_config
+
+
+# ── Data Classes ──────────────────────────────────────────────────────────────
+
+@dataclass
+class DriftResult:
+    feature:     str
+    method:      str
+    score:       float
+    p_value:     Optional[float]
+    severity:    str        # "none" | "warning" | "critical"
+    is_drifted:  bool
+    reference_stats: dict = field(default_factory=dict)
+    production_stats: dict = field(default_factory=dict)
+    message:     str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "feature":          self.feature,
+            "method":           self.method,
+            "score":            round(self.score, 6),
+            "p_value":          round(self.p_value, 6) if self.p_value else None,
+            "severity":         self.severity,
+            "is_drifted":       self.is_drifted,
+            "message":          self.message,
+            **{f"ref_{k}":  v for k, v in self.reference_stats.items()},
+            **{f"prod_{k}": v for k, v in self.production_stats.items()},
+        }
+
+
+@dataclass
+class BatchDriftReport:
+    batch_id:           int
+    n_reference:        int
+    n_production:       int
+    overall_drift_score: float
+    overall_severity:   str
+    n_drifted_features: int
+    drift_results:      List[DriftResult]
+    prediction_drift:   Optional[DriftResult] = None
+    label_drift:        Optional[DriftResult] = None
+
+    @property
+    def drifted_features(self) -> List[str]:
+        return [r.feature for r in self.drift_results if r.is_drifted]
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame([r.to_dict() for r in self.drift_results])
+
+    def summary(self) -> dict:
+        return {
+            "batch_id":             self.batch_id,
+            "n_reference":          self.n_reference,
+            "n_production":         self.n_production,
+            "overall_drift_score":  round(self.overall_drift_score, 4),
+            "overall_severity":     self.overall_severity,
+            "n_drifted_features":   self.n_drifted_features,
+            "drifted_features":     self.drifted_features,
+        }
+
+
+# ── PSI ───────────────────────────────────────────────────────────────────────
+
+def compute_psi(
+    reference: np.ndarray,
+    production: np.ndarray,
+    n_bins: int = 10
+) -> float:
+    """
+    Population Stability Index.
+    PSI = Σ (actual% - expected%) × ln(actual% / expected%)
+    Interpretation:
+      < 0.10 → no drift
+      0.10–0.20 → moderate drift (investigate)
+      > 0.20 → significant drift (action required)
+    """
+    # Create bins from reference distribution
+    min_val = min(reference.min(), production.min())
+    max_val = max(reference.max(), production.max())
+    bins = np.linspace(min_val, max_val, n_bins + 1)
+    bins[0]  -= 1e-10   # include exact minimum
+    bins[-1] += 1e-10   # include exact maximum
+
+    ref_counts,  _ = np.histogram(reference,  bins=bins)
+    prod_counts, _ = np.histogram(production, bins=bins)
+
+    # Avoid division by zero
+    epsilon = 1e-10
+    ref_pct  = (ref_counts  / len(reference))  + epsilon
+    prod_pct = (prod_counts / len(production)) + epsilon
+
+    psi = np.sum((prod_pct - ref_pct) * np.log(prod_pct / ref_pct))
+    return float(psi)
+
+
+def _psi_severity(psi: float) -> tuple[str, bool]:
+    if psi > drift_config.psi_critical:
+        return "critical", True
+    elif psi > drift_config.psi_warning:
+        return "warning", True
+    return "none", False
+
+
+# ── KS Test ───────────────────────────────────────────────────────────────────
+
+def compute_ks(reference: np.ndarray, production: np.ndarray) -> tuple[float, float]:
+    """Kolmogorov–Smirnov two-sample test. Returns (statistic, p_value)."""
+    stat, p_value = ks_2samp(reference, production)
+    return float(stat), float(p_value)
+
+
+# ── Jensen–Shannon Divergence ──────────────────────────────────────────────────
+
+def compute_jsd(
+    reference: np.ndarray,
+    production: np.ndarray,
+    n_bins: int = 20
+) -> float:
+    """
+    Jensen–Shannon Divergence (0 = identical, 1 = completely different).
+    Uses histogram approximation for continuous features.
+    """
+    min_val = min(reference.min(), production.min())
+    max_val = max(reference.max(), production.max())
+
+    if max_val == min_val:
+        return 0.0
+
+    bins = np.linspace(min_val, max_val, n_bins + 1)
+    epsilon = 1e-10
+
+    ref_hist,  _ = np.histogram(reference,  bins=bins, density=True)
+    prod_hist, _ = np.histogram(production, bins=bins, density=True)
+
+    ref_dist  = ref_hist  / (ref_hist.sum()  + epsilon) + epsilon
+    prod_dist = prod_hist / (prod_hist.sum() + epsilon) + epsilon
+
+    return float(jensenshannon(ref_dist, prod_dist))
+
+
+# ── Wasserstein Distance ──────────────────────────────────────────────────────
+
+def compute_wasserstein(reference: np.ndarray, production: np.ndarray) -> float:
+    """
+    Wasserstein-1 distance (Earth Mover's Distance), normalized by reference std.
+    Returns 0 if both arrays are constant.
+    """
+    ref_std = reference.std()
+    if ref_std < 1e-10:
+        return 0.0
+    w = wasserstein_distance(reference, production)
+    return float(w / ref_std)
+
+
+# ── Chi-Square (categorical) ──────────────────────────────────────────────────
+
+def compute_chi2(
+    reference: pd.Series,
+    production: pd.Series
+) -> tuple[float, float]:
+    """
+    Chi-square test for categorical feature distributions.
+    Returns (statistic, p_value).
+    """
+    all_categories = list(set(reference.unique()) | set(production.unique()))
+    ref_counts  = reference.value_counts().reindex(all_categories, fill_value=1)
+    prod_counts = production.value_counts().reindex(all_categories, fill_value=1)
+
+    # Contingency table
+    contingency = np.array([ref_counts.values, prod_counts.values])
+    stat, p_value, _, _ = chi2_contingency(contingency)
+    return float(stat), float(p_value)
+
+
+# ── Main Detector Class ────────────────────────────────────────────────────────
+
+class DriftDetector:
+    """
+    Stateful drift detector that holds the reference distribution
+    and compares each production batch against it.
+
+    Usage:
+        detector = DriftDetector(reference_df)
+        report = detector.detect(production_batch_df, batch_id=5)
+    """
+
+    def __init__(self, reference_df: pd.DataFrame):
+        self.reference_df   = reference_df.copy()
+        self.n_reference    = len(reference_df)
+        self._validate_data(reference_df)
+        logger.info(
+            f"DriftDetector initialized: {self.n_reference} reference samples, "
+            f"{len(model_config.numerical_features)} numerical + "
+            f"{len(model_config.categorical_features)} categorical features"
+        )
+
+    def _validate_data(self, df: pd.DataFrame) -> None:
+        for feat in model_config.numerical_features + model_config.categorical_features:
+            if feat not in df.columns:
+                logger.warning(f"Feature '{feat}' missing from dataframe")
+
+    def _feature_stats(self, series: pd.Series) -> dict:
+        return {
+            "mean":  round(float(series.mean()), 4),
+            "std":   round(float(series.std()),  4),
+            "p25":   round(float(series.quantile(0.25)), 4),
+            "p50":   round(float(series.quantile(0.50)), 4),
+            "p75":   round(float(series.quantile(0.75)), 4),
+        }
+
+    def _detect_numerical(
+        self, feature: str, production_df: pd.DataFrame
+    ) -> DriftResult:
+        """Run PSI + KS + JSD + Wasserstein on a single numerical feature."""
+        ref  = self.reference_df[feature].dropna().values
+        prod = production_df[feature].dropna().values
+
+        if len(prod) < drift_config.min_samples:
+            return DriftResult(
+                feature=feature, method="PSI", score=0.0, p_value=None,
+                severity="none", is_drifted=False,
+                message=f"Insufficient samples ({len(prod)} < {drift_config.min_samples})"
+            )
+
+        psi              = compute_psi(ref, prod)
+        ks_stat, ks_p    = compute_ks(ref, prod)
+        jsd              = compute_jsd(ref, prod)
+        wass             = compute_wasserstein(ref, prod)
+
+        severity, drifted = _psi_severity(psi)
+
+        # Escalate if KS test also significant
+        if ks_p < drift_config.ks_p_value_threshold and psi > drift_config.psi_warning * 0.5:
+            if severity == "none":
+                severity, drifted = "warning", True
+
+        msg_parts = [f"PSI={psi:.4f}", f"KS_p={ks_p:.4f}", f"JSD={jsd:.4f}", f"Wass={wass:.4f}"]
+        return DriftResult(
+            feature=feature,
+            method="PSI+KS+JSD+Wasserstein",
+            score=psi,
+            p_value=ks_p,
+            severity=severity,
+            is_drifted=drifted,
+            reference_stats=self._feature_stats(self.reference_df[feature]),
+            production_stats=self._feature_stats(production_df[feature]),
+            message=" | ".join(msg_parts),
+        )
+
+    def _detect_categorical(
+        self, feature: str, production_df: pd.DataFrame
+    ) -> DriftResult:
+        """Run Chi-Square + JSD on a single categorical feature."""
+        ref  = self.reference_df[feature].dropna()
+        prod = production_df[feature].dropna()
+
+        chi2_stat, chi2_p = compute_chi2(ref, prod)
+        drifted  = chi2_p < drift_config.chi2_p_value_threshold
+        severity = "warning" if drifted else "none"
+
+        # Use JSD as the score (normalized)
+        jsd = compute_jsd(
+            ref.map({v: i for i, v in enumerate(ref.unique())}).values,
+            prod.map({v: ref.unique().tolist().index(v) if v in ref.unique() else -1
+                      for v in prod.unique()}).values
+        )
+        if drifted and jsd > drift_config.jsd_critical:
+            severity = "critical"
+
+        return DriftResult(
+            feature=feature,
+            method="Chi2+JSD",
+            score=chi2_stat,
+            p_value=chi2_p,
+            severity=severity,
+            is_drifted=drifted,
+            reference_stats={"top_category": str(ref.value_counts().index[0]),
+                             "n_categories": int(ref.nunique())},
+            production_stats={"top_category": str(prod.value_counts().index[0]),
+                              "n_categories": int(prod.nunique())},
+            message=f"Chi2={chi2_stat:.2f} | p={chi2_p:.4f} | JSD={jsd:.4f}",
+        )
+
+    def _detect_prediction_drift(
+        self,
+        ref_preds: np.ndarray,
+        prod_preds: np.ndarray,
+    ) -> DriftResult:
+        """Drift in the model's output score distribution."""
+        psi       = compute_psi(ref_preds, prod_preds)
+        jsd       = compute_jsd(ref_preds, prod_preds)
+        ks_s, ks_p = compute_ks(ref_preds, prod_preds)
+        severity, drifted = _psi_severity(psi)
+        return DriftResult(
+            feature="prediction_score",
+            method="PSI+KS",
+            score=psi,
+            p_value=ks_p,
+            severity=severity,
+            is_drifted=drifted,
+            reference_stats=self._feature_stats(pd.Series(ref_preds)),
+            production_stats=self._feature_stats(pd.Series(prod_preds)),
+            message=f"Prediction PSI={psi:.4f} | KS_p={ks_p:.4f} | JSD={jsd:.4f}",
+        )
+
+    def detect(
+        self,
+        production_df: pd.DataFrame,
+        batch_id: int = 0,
+        ref_predictions: np.ndarray = None,
+        prod_predictions: np.ndarray = None,
+    ) -> BatchDriftReport:
+        """
+        Run all drift tests on a production batch.
+
+        Args:
+            production_df:    New batch to evaluate
+            batch_id:         Sequential batch identifier
+            ref_predictions:  Model scores on reference data (for prediction drift)
+            prod_predictions: Model scores on production batch
+
+        Returns:
+            BatchDriftReport with per-feature results and aggregate severity
+        """
+        results = []
+
+        # Numerical features
+        for feat in model_config.numerical_features:
+            if feat in production_df.columns and feat in self.reference_df.columns:
+                results.append(self._detect_numerical(feat, production_df))
+
+        # Categorical features
+        for feat in model_config.categorical_features:
+            if feat in production_df.columns and feat in self.reference_df.columns:
+                results.append(self._detect_categorical(feat, production_df))
+
+        # Prediction drift
+        pred_drift = None
+        if ref_predictions is not None and prod_predictions is not None:
+            pred_drift = self._detect_prediction_drift(ref_predictions, prod_predictions)
+
+        # ── Aggregate score ─────────────────────────────────────────────────
+        n_drifted = sum(r.is_drifted for r in results)
+        n_critical = sum(r.severity == "critical" for r in results)
+
+        # Overall drift score: weighted average PSI of numerical + chi2-normalized categoricals
+        scores = [r.score for r in results if r.score is not None and not np.isnan(r.score)]
+        overall_score = float(np.mean(scores)) if scores else 0.0
+
+        if n_critical > 0:
+            overall_severity = "critical"
+        elif n_drifted > len(results) * 0.3:
+            overall_severity = "critical"
+        elif n_drifted > 0:
+            overall_severity = "warning"
+        else:
+            overall_severity = "none"
+
+        report = BatchDriftReport(
+            batch_id=batch_id,
+            n_reference=self.n_reference,
+            n_production=len(production_df),
+            overall_drift_score=overall_score,
+            overall_severity=overall_severity,
+            n_drifted_features=n_drifted,
+            drift_results=results,
+            prediction_drift=pred_drift,
+        )
+
+        logger.info(
+            f"Batch {batch_id}: severity={overall_severity} | "
+            f"drifted={n_drifted}/{len(results)} features | "
+            f"score={overall_score:.4f}"
+        )
+        return report
