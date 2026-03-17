@@ -1,0 +1,378 @@
+"""
+add_dataset.py — Interactive CLI for Registering New Datasets
+
+Allows you to add any CSV/Excel dataset to the BMS monitoring system.
+After registration the dataset is:
+  1. Validated (schema check, null rates, class balance)
+  2. Saved as an immutable snapshot in data/datasets/
+  3. Indexed in the DatasetRegistry database
+  4. Available to all models for training and drift comparison
+
+Usage (interactive):
+    python -m src.cli.add_dataset
+
+Usage (scripted):
+    python -m src.cli.add_dataset \\
+        --path data/my_battery_data.csv \\
+        --name northvolt_lfp_2026 \\
+        --domain battery \\
+        --version 1.0.0 \\
+        --target soh \\
+        --description "Northvolt LFP cells 2026 campaign"
+
+Augmentation (create larger dataset from small one):
+    python -m src.cli.add_dataset --augment northvolt_lfp_2026 --n-augmented 1000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+SUPPORTED_DOMAINS = ["battery", "churn", "ltv", "propensity", "custom"]
+SUPPORTED_FORMATS = [".csv", ".xlsx", ".xls", ".tsv", ".parquet"]
+
+
+def print_banner():
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║          BMS Monitoring — Add New Dataset                   ║
+║  Registers a dataset into the monitoring data catalogue     ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+
+
+def print_dataset_summary(df: pd.DataFrame, target: Optional[str] = None):
+    """Pretty-print a summary of the dataset."""
+    print(f"\n{'─'*60}")
+    print(f"  Rows:    {len(df):,}")
+    print(f"  Columns: {len(df.columns)}")
+    print(f"  Memory:  {df.memory_usage(deep=True).sum() / 1024:.1f} KB")
+
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    print(f"  Numeric columns ({len(num_cols)}): {', '.join(num_cols[:6])}{'...' if len(num_cols) > 6 else ''}")
+    print(f"  Categorical cols ({len(cat_cols)}): {', '.join(cat_cols[:4])}{'...' if len(cat_cols) > 4 else ''}")
+
+    null_pct = df.isnull().mean()
+    high_null = null_pct[null_pct > 0.05]
+    if not high_null.empty:
+        print(f"\n  ⚠️  Columns with >5% nulls:")
+        for col, pct in high_null.items():
+            print(f"     {col}: {pct*100:.1f}%")
+
+    if target and target in df.columns:
+        vc = df[target].value_counts()
+        print(f"\n  Target '{target}' distribution:")
+        for val, count in vc.head(5).items():
+            bar = "█" * int(count / len(df) * 30)
+            print(f"     {val!s:<15} {count:>6,} ({count/len(df)*100:5.1f}%) {bar}")
+
+    print(f"{'─'*60}\n")
+
+
+def interactive_add_dataset() -> None:
+    """Walk the user through adding a dataset step by step."""
+    print_banner()
+
+    # ── Step 1: File path ─────────────────────────────────────────────────
+    print("Step 1/7 — Dataset File")
+    print(f"  Supported formats: {', '.join(SUPPORTED_FORMATS)}")
+    path_str = input("  Path to dataset file: ").strip()
+    path = Path(path_str)
+
+    if not path.exists():
+        print(f"❌ File not found: {path}")
+        print("   Tip: Use Tab completion or check the path with `ls data/`")
+        return
+
+    # Load and preview
+    print(f"\n  Loading {path.name}...")
+    try:
+        if path.suffix.lower() in (".xlsx", ".xls"):
+            df = pd.read_excel(path)
+        elif path.suffix.lower() == ".parquet":
+            df = pd.read_parquet(path)
+        elif path.suffix.lower() == ".tsv":
+            df = pd.read_csv(path, sep="\t")
+        else:
+            df = pd.read_csv(path)
+        print(f"  ✅ Loaded: {len(df):,} rows × {len(df.columns)} columns")
+    except Exception as e:
+        print(f"  ❌ Failed to load file: {e}")
+        return
+
+    # ── Step 2: Dataset name ──────────────────────────────────────────────
+    print("\nStep 2/7 — Dataset Name")
+    default_name = path.stem.lower().replace(" ", "_").replace("-", "_")
+    print(f"  Default: {default_name}")
+    name = input(f"  Name [{default_name}]: ").strip() or default_name
+
+    # ── Step 3: Version ───────────────────────────────────────────────────
+    print("\nStep 3/7 — Version")
+    version = input("  Version [1.0.0]: ").strip() or "1.0.0"
+
+    # ── Step 4: Domain ────────────────────────────────────────────────────
+    print("\nStep 4/7 — Domain")
+    for i, d in enumerate(SUPPORTED_DOMAINS, 1):
+        print(f"  {i}. {d}")
+    dom_input = input("  Select domain [1=battery]: ").strip() or "1"
+    try:
+        domain = SUPPORTED_DOMAINS[int(dom_input) - 1]
+    except (ValueError, IndexError):
+        domain = "battery"
+    print(f"  → {domain}")
+
+    # ── Step 5: Target column ─────────────────────────────────────────────
+    print("\nStep 5/7 — Target Column (the column your model predicts)")
+    print(f"  Available columns: {', '.join(df.columns.tolist()[:10])}")
+    if len(df.columns) > 10:
+        print(f"  ... and {len(df.columns) - 10} more")
+    target = input("  Target column [press Enter to skip]: ").strip() or None
+    if target and target not in df.columns:
+        print(f"  ⚠️  Column '{target}' not found. Setting to None.")
+        target = None
+
+    # Show dataset summary
+    print_dataset_summary(df, target)
+
+    # ── Step 6: Description ───────────────────────────────────────────────
+    print("Step 6/7 — Description")
+    description = input("  Short description: ").strip()
+
+    # ── Step 7: Tags ──────────────────────────────────────────────────────
+    print("\nStep 7/7 — Tags (optional)")
+    print("  Example: chemistry=NMC,source=lab,year=2026")
+    tag_input = input("  Tags [press Enter to skip]: ").strip()
+    tags: Dict[str, str] = {"domain": domain}
+    if tag_input:
+        for pair in tag_input.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                tags[k.strip()] = v.strip()
+
+    # ── Preview & confirm ─────────────────────────────────────────────────
+    print("\n" + "─" * 60)
+    print("📋 Dataset Registration Summary")
+    print("─" * 60)
+    print(f"  Name:        {name}")
+    print(f"  Version:     {version}")
+    print(f"  File:        {path.name}")
+    print(f"  Rows:        {len(df):,}")
+    print(f"  Columns:     {len(df.columns)}")
+    print(f"  Domain:      {domain}")
+    print(f"  Target:      {target or '(none)'}")
+    print(f"  Description: {description or '(none)'}")
+    print(f"  Tags:        {tags}")
+    print("─" * 60)
+
+    confirm = input("\nRegister this dataset? [Y/n]: ").strip().lower()
+    if confirm not in ("", "y", "yes"):
+        print("Cancelled.")
+        return
+
+    _do_register(
+        df=df,
+        name=name,
+        version=version,
+        domain=domain,
+        description=description,
+        tags=tags,
+        target_column=target,
+        source_filename=path.name,
+    )
+
+    # ── Augment? ──────────────────────────────────────────────────────────
+    if len(df) < 1000:
+        print(f"\n  ⚠️  Dataset is small ({len(df)} rows).")
+        aug = input("  Create augmented copy with noise injection? [y/N]: ").strip().lower()
+        if aug in ("y", "yes"):
+            n_aug = input("  How many augmented rows? [500]: ").strip() or "500"
+            _do_augment(name, version, int(n_aug))
+
+
+def _do_register(
+    df:              pd.DataFrame,
+    name:            str,
+    version:         str,
+    domain:          str,
+    description:     str,
+    tags:            Dict[str, str],
+    target_column:   Optional[str],
+    source_filename: str = "",
+) -> int:
+    try:
+        from src.data.dataset_registry import DatasetRegistry
+        registry = DatasetRegistry()
+        dataset_id = registry.register_from_dataframe(
+            df=df,
+            name=name,
+            version=version,
+            domain=domain,
+            description=description or f"{domain} dataset from {source_filename}",
+            tags=tags,
+            target_column=target_column,
+            source_filename=source_filename,
+        )
+        print(f"\n✅ Dataset registered successfully!")
+        print(f"   dataset_id = {dataset_id}")
+        print(f"   Name       = {name} v{version}")
+        print(f"   Saved to   = data/datasets/{name.replace(' ','_')}_v{version}.csv")
+        print("\n📌 To use this dataset for training:")
+        print(f'   from src.data.dataset_registry import DatasetRegistry')
+        print(f'   df = DatasetRegistry().load_dataset("{name}", "{version}")')
+        return dataset_id
+    except Exception as e:
+        logger.error(f"Registration failed: {e}")
+        print(f"\n❌ Registration failed: {e}")
+        return -1
+
+
+def _do_augment(name: str, version: str, n_augmented: int) -> None:
+    try:
+        from src.data.dataset_registry import DatasetRegistry
+        registry  = DatasetRegistry()
+        new_ver   = version + "-aug"
+        new_id    = registry.augment_dataset(
+            name=name,
+            version=version,
+            n_augmented=n_augmented,
+            new_version=new_ver,
+        )
+        print(f"✅ Augmented dataset created: {name} v{new_ver} (id={new_id})")
+    except Exception as e:
+        print(f"❌ Augmentation failed: {e}")
+
+
+# ── Scripted mode ─────────────────────────────────────────────────────────────
+
+def scripted_add_dataset(args) -> None:
+    path = Path(args.path)
+    if not path.exists():
+        print(f"❌ File not found: {path}")
+        sys.exit(1)
+
+    # Load
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+
+    tags = {"domain": args.domain}
+    if args.tags:
+        for pair in args.tags.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                tags[k.strip()] = v.strip()
+
+    _do_register(
+        df=df,
+        name=args.name,
+        version=args.version,
+        domain=args.domain,
+        description=args.description or "",
+        tags=tags,
+        target_column=args.target,
+        source_filename=path.name,
+    )
+
+    if args.augment:
+        _do_augment(args.name, args.version, args.augment)
+
+
+# ── List datasets ─────────────────────────────────────────────────────────────
+
+def list_all_datasets() -> None:
+    try:
+        from src.data.dataset_registry import DatasetRegistry
+        registry = DatasetRegistry()
+        df = registry.list_datasets()
+        if df.empty:
+            print("No datasets registered yet.")
+            print("Run: python -m src.cli.add_dataset")
+            return
+
+        print("\n📦 Registered Datasets")
+        print("─" * 80)
+        for _, row in df.iterrows():
+            cols = row.get("columns", [])
+            if isinstance(cols, str):
+                import json as _json
+                cols = _json.loads(cols)
+            print(
+                f"  [{row['dataset_id']:>3}]  {row['name']:<30}  v{row['version']:<8}  "
+                f"{row['domain']:<12}  {row['n_rows']:>7,} rows  "
+                f"{row['n_cols']:>3} cols"
+            )
+        print("─" * 80)
+        print(f"  Total: {len(df)} dataset(s)")
+    except Exception as e:
+        print(f"❌ Could not list datasets: {e}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Add a new dataset to the BMS Monitoring System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive (recommended):
+  python -m src.cli.add_dataset
+
+  # Scripted:
+  python -m src.cli.add_dataset \\
+    --path data/northvolt_lfp.csv \\
+    --name northvolt_lfp_2026 \\
+    --domain battery \\
+    --target soh
+
+  # List all registered datasets:
+  python -m src.cli.add_dataset --list
+
+  # Augment an existing small dataset:
+  python -m src.cli.add_dataset --augment 500 \\
+    --name my_small_dataset --version 1.0.0
+        """,
+    )
+    parser.add_argument("--path",        help="Path to dataset file (.csv, .xlsx, etc.)")
+    parser.add_argument("--name",        help="Dataset name (unique identifier)")
+    parser.add_argument("--version",     default="1.0.0", help="Version (default: 1.0.0)")
+    parser.add_argument("--domain",      default="battery",
+                        choices=SUPPORTED_DOMAINS, help="Dataset domain")
+    parser.add_argument("--target",      help="Target column name (what the model predicts)")
+    parser.add_argument("--description", default="", help="Human-readable description")
+    parser.add_argument("--tags",        help="Comma-separated key=value tags")
+    parser.add_argument("--augment",     type=int, metavar="N",
+                        help="Augment with N additional rows (noise injection)")
+    parser.add_argument("--list",        action="store_true",
+                        help="List all registered datasets and exit")
+
+    args = parser.parse_args()
+
+    if args.list:
+        list_all_datasets()
+    elif not args.path or not args.name:
+        interactive_add_dataset()
+    else:
+        scripted_add_dataset(args)
+
+
+if __name__ == "__main__":
+    main()
