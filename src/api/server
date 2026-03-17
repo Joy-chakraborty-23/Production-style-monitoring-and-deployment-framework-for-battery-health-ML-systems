@@ -1,0 +1,629 @@
+"""
+server.py — FastAPI Real-Time Inference Server
+
+NOTE: This module currently exposes a legacy churn-oriented API surface from the
+original reusable monitoring-core phase of the repository. The repo’s primary
+identity is now battery/BMS-first; this server remains as a reference serving
+example until a dedicated BMS API surface fully replaces it.
+
+Replaces the batch CSV simulation with a live HTTP API.
+
+Endpoints
+─────────
+POST /predict          Score a single customer record; returns churn probability
+POST /predict/batch    Score a list of records in one call
+GET  /health           Liveness probe — returns model status + system metrics
+GET  /metrics          Current sliding-window drift + ROI snapshot
+GET  /window/stats     Distribution statistics for the current feature window
+DELETE /window/reset   Clear the feature buffer (useful for testing)
+
+Architecture
+────────────
+Every prediction request:
+  1. Validates input schema (Pydantic)
+  2. Passes features to the loaded sklearn Pipeline
+  3. Logs the raw features + prediction into a thread-safe sliding window
+  4. Returns probability + latency
+
+Every 500 requests (configurable) the background drift checker:
+  1. Pulls the window snapshot
+  2. Runs DriftDetector.detect() against the reference distribution
+  3. Computes ROI impact of current AUC estimate
+  4. Appends result to server_drift_log.json
+  5. Fires an alert if severity is warning/critical
+
+Run locally
+───────────
+    uvicorn src.api.server:app --reload --port 8000
+
+Then send a test prediction:
+    curl -X POST http://localhost:8000/predict \
+      -H "Content-Type: application/json" \
+      -d '{"tenure":6,"monthly_charges":85,"total_charges":510,
+           "num_products":1,"num_support_calls":5,"avg_call_duration":12,
+           "days_since_last_login":45,"data_usage_gb":8.5,
+           "billing_amount_variance":12,"customer_lifetime_value":2100,
+           "contract_type":"Month-to-month","payment_method":"Electronic check",
+           "internet_service":"Fiber optic","tech_support":"No",
+           "online_security":"No","paperless_billing":"Yes"}'
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import threading
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import psutil
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+from pydantic import BaseModel, Field, field_validator
+
+# ── Project imports ──────────────────────────────────────────────────────────
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from src.config import model_config, roi_config, MODELS_DIR
+from src.models.train_model import load_model
+from src.monitoring.drift_detector import DriftDetector
+from src.monitoring.roi_calculator import ROICalculator
+from src.alerts.alert_manager import AlertManager, fire_drift_alert
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ════════════════════════════════════════════════════════════════════════════
+
+WINDOW_SIZE          = 1_000   # max records kept in the sliding window
+DRIFT_CHECK_EVERY    = 500     # run drift check after this many predictions
+SERVER_LOG_PATH      = MODELS_DIR / "server_drift_log.json"
+PREDICTION_LOG_PATH  = MODELS_DIR / "prediction_log.json"
+REFERENCE_DATA_PATH  = Path("data") / "reference_data.csv"
+
+# Default classification threshold
+DEFAULT_THRESHOLD = 0.50
+
+CONTRACT_TYPES     = ["Month-to-month", "One year", "Two year"]
+PAYMENT_METHODS    = ["Electronic check", "Mailed check", "Bank transfer", "Credit card"]
+INTERNET_SERVICES  = ["DSL", "Fiber optic", "No"]
+YES_NO             = ["Yes", "No"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Pydantic schemas
+# ════════════════════════════════════════════════════════════════════════════
+
+class CustomerFeatures(BaseModel):
+    """Input schema — matches the 16 features the pipeline was trained on."""
+    tenure:                   float = Field(..., ge=0,   le=100,  description="Months as a customer")
+    monthly_charges:          float = Field(..., ge=0,   le=500,  description="Monthly bill amount")
+    total_charges:            float = Field(..., ge=0,             description="Total billed to date")
+    num_products:             int   = Field(..., ge=1,   le=10,   description="Number of active products")
+    num_support_calls:        int   = Field(..., ge=0,   le=50,   description="Support calls in last 90 days")
+    avg_call_duration:        float = Field(..., ge=0,             description="Average support call duration (min)")
+    days_since_last_login:    int   = Field(..., ge=0,             description="Days since last app/web login")
+    data_usage_gb:            float = Field(..., ge=0,             description="Monthly data usage in GB")
+    billing_amount_variance:  float = Field(..., ge=0,             description="Variance in billing amount")
+    customer_lifetime_value:  float = Field(..., ge=0,             description="Estimated customer LTV")
+    contract_type:            str   = Field(...,                   description="Contract type")
+    payment_method:           str   = Field(...,                   description="Payment method")
+    internet_service:         str   = Field(...,                   description="Internet service type")
+    tech_support:             str   = Field(...,                   description="Has tech support add-on")
+    online_security:          str   = Field(...,                   description="Has online security add-on")
+    paperless_billing:        str   = Field(...,                   description="Uses paperless billing")
+
+    @field_validator("contract_type")
+    @classmethod
+    def validate_contract(cls, v):
+        if v not in CONTRACT_TYPES:
+            raise ValueError(f"contract_type must be one of {CONTRACT_TYPES}")
+        return v
+
+    @field_validator("payment_method")
+    @classmethod
+    def validate_payment(cls, v):
+        if v not in PAYMENT_METHODS:
+            raise ValueError(f"payment_method must be one of {PAYMENT_METHODS}")
+        return v
+
+    @field_validator("internet_service")
+    @classmethod
+    def validate_internet(cls, v):
+        if v not in INTERNET_SERVICES:
+            raise ValueError(f"internet_service must be one of {INTERNET_SERVICES}")
+        return v
+
+    @field_validator("tech_support", "online_security", "paperless_billing")
+    @classmethod
+    def validate_yes_no(cls, v):
+        if v not in YES_NO:
+            raise ValueError(f"Value must be one of {YES_NO}")
+        return v
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame([self.model_dump()])
+
+
+class BatchPredictRequest(BaseModel):
+    records: List[CustomerFeatures] = Field(..., min_length=1, max_length=500)
+    threshold: float = Field(DEFAULT_THRESHOLD, ge=0.01, le=0.99)
+
+
+class PredictResponse(BaseModel):
+    churn_probability: float
+    churn_prediction:  bool
+    risk_level:        str   # "low" | "medium" | "high"
+    threshold_used:    float
+    latency_ms:        float
+    request_id:        str
+    model_version:     str
+
+
+class BatchPredictResponse(BaseModel):
+    predictions:  List[PredictResponse]
+    n_records:    int
+    n_high_risk:  int
+    latency_ms:   float
+
+
+class HealthResponse(BaseModel):
+    status:          str
+    model_loaded:    bool
+    window_size:     int
+    predictions_served: int
+    last_drift_check:   Optional[str]
+    last_drift_severity: str
+    cpu_pct:         float
+    memory_pct:      float
+    uptime_seconds:  float
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Server State  (module-level singletons, initialised on startup)
+# ════════════════════════════════════════════════════════════════════════════
+
+class ServerState:
+    """Thread-safe server state container."""
+
+    def __init__(self):
+        self._lock               = threading.Lock()
+        self.pipeline            = None
+        self.drift_detector      = None
+        self.roi_calculator      = None
+        self.alert_manager       = None
+        self.reference_df        = None
+        self.model_version       = "unknown"
+
+        # Sliding window: stores dicts of {features..., prediction, timestamp}
+        self._window: deque      = deque(maxlen=WINDOW_SIZE)
+
+        # Counters
+        self.predictions_served  = 0
+        self.last_drift_check    = None
+        self.last_drift_severity = "none"
+        self.start_time          = time.time()
+
+        # In-memory drift log (also persisted to disk)
+        self.drift_log: list     = []
+
+    def add_to_window(self, record: dict) -> None:
+        with self._lock:
+            self._window.append(record)
+            self.predictions_served += 1
+
+    def get_window_snapshot(self) -> pd.DataFrame:
+        with self._lock:
+            if not self._window:
+                return pd.DataFrame()
+            return pd.DataFrame(list(self._window))
+
+    @property
+    def window_size(self) -> int:
+        with self._lock:
+            return len(self._window)
+
+    def is_ready(self) -> bool:
+        return self.pipeline is not None
+
+
+state = ServerState()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FastAPI app
+# ════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="Legacy Tabular Monitoring API (Reference Serving Layer)",
+    description=(
+        "Legacy reference API retained from the reusable tabular monitoring core. "
+        "Primary repository story is battery/BMS monitoring."
+    ),
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+
+# ── Startup / shutdown ────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    """Load model, reference data, and initialise monitoring components."""
+    logger.info("FastAPI server starting — loading components...")
+
+    # Load model pipeline
+    try:
+        state.pipeline = load_model()
+        state.model_version = "churn_xgboost_v1"
+        logger.info(f"Model loaded: {MODELS_DIR / 'churn_pipeline.joblib'}")
+    except FileNotFoundError:
+        logger.warning(
+            "No trained model found. Run 'python -m src.models.train_model' first. "
+            "Server will start but /predict will return 503 until model is loaded."
+        )
+
+    # Load reference data for drift detection
+    if REFERENCE_DATA_PATH.exists():
+        state.reference_df = pd.read_csv(REFERENCE_DATA_PATH)
+        logger.info(f"Reference data loaded: {len(state.reference_df)} rows")
+
+        if state.pipeline is not None:
+            state.drift_detector = DriftDetector(state.reference_df)
+            logger.info("DriftDetector initialised against reference distribution")
+
+            # Compute baseline AUC on reference data for ROI calculator
+            try:
+                from sklearn.metrics import roc_auc_score
+                _ref_X = state.reference_df[
+                    model_config.numerical_features + model_config.categorical_features
+                ].copy()
+                _ref_y = state.reference_df["churn"]
+                _baseline_auc = float(roc_auc_score(
+                    _ref_y, state.pipeline.predict_proba(_ref_X)[:, 1]
+                ))
+            except Exception:
+                _baseline_auc = 0.87
+
+            state.roi_calculator = ROICalculator(
+                monthly_customers      = roi_config.monthly_customers,
+                avg_ltv                = roi_config.avg_customer_ltv,
+                outreach_cost_per_call = roi_config.outreach_cost_per_call,
+                baseline_auc           = _baseline_auc,
+                true_churn_rate        = roi_config.true_churn_rate,
+                outreach_coverage      = roi_config.outreach_coverage,
+                recall_sensitivity     = roi_config.recall_sensitivity,
+            )
+            logger.info(f"ROICalculator initialised — baseline AUC: {_baseline_auc:.4f}")
+    else:
+        logger.warning(
+            f"Reference data not found at {REFERENCE_DATA_PATH}. "
+            "Drift detection will be skipped. Run 'python -m src.data.data_generator' first."
+        )
+
+    state.alert_manager = AlertManager()
+    logger.info("AlertManager initialised")
+    logger.info("Server startup complete")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Helper functions
+# ════════════════════════════════════════════════════════════════════════════
+
+def _require_model():
+    """Raise 503 if model is not loaded."""
+    if not state.is_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="Model not loaded. Run 'python -m src.models.train_model' then restart."
+        )
+
+
+def _risk_level(prob: float) -> str:
+    if prob >= 0.70:
+        return "high"
+    if prob >= 0.40:
+        return "medium"
+    return "low"
+
+
+def _score_single(features: CustomerFeatures, threshold: float) -> tuple[float, float]:
+    """
+    Run inference on one record.
+
+    Returns:
+        (churn_probability, latency_ms)
+    """
+    t0 = time.perf_counter()
+    X  = features.to_dataframe()
+    prob = float(state.pipeline.predict_proba(X)[0, 1])
+    latency_ms = (time.perf_counter() - t0) * 1_000
+    return prob, latency_ms
+
+
+def _log_to_window(features: CustomerFeatures, prob: float) -> None:
+    """Append a prediction record to the sliding window."""
+    record = features.model_dump()
+    record["prediction_score"] = prob
+    record["timestamp"]        = time.time()
+    state.add_to_window(record)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Background drift check  (runs after every DRIFT_CHECK_EVERY predictions)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _run_drift_check() -> None:
+    """
+    Pull the current window, run DriftDetector, compute ROI impact,
+    persist a snapshot, and fire alerts if needed.
+
+    Runs in a background thread — never blocks the prediction response.
+    """
+    if state.drift_detector is None or state.roi_calculator is None:
+        return
+
+    window_df = state.get_window_snapshot()
+    if len(window_df) < 100:
+        logger.debug(f"Drift check skipped — window too small ({len(window_df)} records)")
+        return
+
+    logger.info(f"Background drift check — window size: {len(window_df)}")
+
+    try:
+        # Use a synthetic batch_id based on prediction count
+        synthetic_batch_id = state.predictions_served // DRIFT_CHECK_EVERY
+
+        # Prediction drift: check the score distribution in the window
+        ref_X = state.reference_df[
+            model_config.numerical_features + model_config.categorical_features
+        ].copy()
+        ref_preds   = state.pipeline.predict_proba(ref_X)[:, 1]
+        window_preds = window_df["prediction_score"].values
+
+        drift_report = state.drift_detector.detect(
+            window_df,
+            batch_id=synthetic_batch_id,
+            ref_predictions=ref_preds,
+            prod_predictions=window_preds,
+        )
+
+        # Estimate current AUC from prediction score distribution shift
+        # (We don't have true labels — use PSI on scores as a proxy)
+        pred_psi     = drift_report.prediction_drift.score if drift_report.prediction_drift else 0.0
+        estimated_auc_drop = min(pred_psi * 0.4, 0.15)
+        estimated_auc      = max(state.roi_calculator.baseline_auc - estimated_auc_drop, 0.5)
+
+        roi_result = state.roi_calculator.compute_monthly_loss(estimated_auc)
+
+        # Build log entry
+        log_entry = {
+            "timestamp":           datetime.now().isoformat(),
+            "predictions_at_check": state.predictions_served,
+            "window_size":         len(window_df),
+            "drift_severity":      drift_report.overall_severity,
+            "drift_score":         round(drift_report.overall_drift_score, 6),
+            "n_drifted_features":  drift_report.n_drifted_features,
+            "drifted_features":    drift_report.drifted_features,
+            "estimated_auc":       round(estimated_auc, 4),
+            "roi_monthly_loss":    roi_result.total_monthly_loss,
+            "roi_status":          roi_result.status,
+            "roi_headline":        roi_result.headline,
+        }
+
+        state.drift_log.append(log_entry)
+        state.last_drift_check    = log_entry["timestamp"]
+        state.last_drift_severity = drift_report.overall_severity
+
+        # Persist drift log
+        SERVER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SERVER_LOG_PATH, "w") as f:
+            json.dump(state.drift_log[-50:], f, indent=2)   # keep last 50 entries
+
+        # Fire alert if needed
+        if drift_report.overall_severity in ("warning", "critical") and state.alert_manager:
+            fire_drift_alert(
+                state.alert_manager,
+                batch_id=synthetic_batch_id,
+                severity=drift_report.overall_severity,
+                drifted_features=drift_report.drifted_features,
+                drift_score=drift_report.overall_drift_score,
+            )
+
+        logger.info(
+            f"Drift check complete — severity={drift_report.overall_severity} | "
+            f"est_auc={estimated_auc:.4f} | roi={roi_result.headline[:60]}"
+        )
+
+    except Exception as exc:
+        logger.error(f"Background drift check failed: {exc}")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/predict", response_model=PredictResponse, summary="Score a single customer record")
+async def predict(
+    features: CustomerFeatures,
+    background_tasks: BackgroundTasks,
+    threshold: float = DEFAULT_THRESHOLD,
+):
+    """
+    Predict churn probability for a single customer.
+
+    Returns the probability score, binary prediction at the chosen threshold,
+    risk level, and inference latency in milliseconds.
+    """
+    _require_model()
+
+    prob, latency_ms = _score_single(features, threshold)
+    _log_to_window(features, prob)
+
+    # Trigger background drift check every DRIFT_CHECK_EVERY predictions
+    if state.predictions_served % DRIFT_CHECK_EVERY == 0 and state.predictions_served > 0:
+        background_tasks.add_task(_run_drift_check)
+
+    return PredictResponse(
+        churn_probability = round(prob, 4),
+        churn_prediction  = prob >= threshold,
+        risk_level        = _risk_level(prob),
+        threshold_used    = threshold,
+        latency_ms        = round(latency_ms, 3),
+        request_id        = f"req_{int(time.time()*1000)}_{state.predictions_served}",
+        model_version     = state.model_version,
+    )
+
+
+@app.post("/predict/batch", response_model=BatchPredictResponse, summary="Score multiple records")
+async def predict_batch(
+    request: BatchPredictRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Score a list of customer records in a single request (max 500).
+
+    More efficient than calling /predict in a loop when you have many records.
+    """
+    _require_model()
+
+    t0 = time.perf_counter()
+    responses = []
+
+    for rec in request.records:
+        prob, lat = _score_single(rec, request.threshold)
+        _log_to_window(rec, prob)
+        responses.append(PredictResponse(
+            churn_probability = round(prob, 4),
+            churn_prediction  = prob >= request.threshold,
+            risk_level        = _risk_level(prob),
+            threshold_used    = request.threshold,
+            latency_ms        = round(lat, 3),
+            request_id        = f"batch_{int(time.time()*1000)}_{state.predictions_served}",
+            model_version     = state.model_version,
+        ))
+
+    total_ms = (time.perf_counter() - t0) * 1_000
+    n_high   = sum(1 for r in responses if r.risk_level == "high")
+
+    if state.predictions_served % DRIFT_CHECK_EVERY == 0 and state.predictions_served > 0:
+        background_tasks.add_task(_run_drift_check)
+
+    return BatchPredictResponse(
+        predictions  = responses,
+        n_records    = len(responses),
+        n_high_risk  = n_high,
+        latency_ms   = round(total_ms, 3),
+    )
+
+
+@app.get("/health", response_model=HealthResponse, summary="Server liveness + model status")
+async def health():
+    """
+    Returns server health, model status, window size, and system resource usage.
+    Use this as a readiness/liveness probe in Kubernetes or Docker.
+    """
+    return HealthResponse(
+        status               = "ok" if state.is_ready() else "degraded",
+        model_loaded         = state.is_ready(),
+        window_size          = state.window_size,
+        predictions_served   = state.predictions_served,
+        last_drift_check     = state.last_drift_check,
+        last_drift_severity  = state.last_drift_severity,
+        cpu_pct              = round(psutil.cpu_percent(interval=None), 1),
+        memory_pct           = round(psutil.virtual_memory().percent, 1),
+        uptime_seconds       = round(time.time() - state.start_time, 1),
+    )
+
+
+@app.get("/metrics", summary="Current drift + ROI snapshot from the sliding window")
+async def metrics():
+    """
+    Returns the most recent drift check result and ROI impact estimate.
+    If no drift check has run yet (fewer than 100 records in window),
+    returns a placeholder with window progress.
+    """
+    if not state.drift_log:
+        return JSONResponse({
+            "status":    "warming_up",
+            "message":   f"Collecting window data — {state.window_size}/{DRIFT_CHECK_EVERY} predictions until first drift check",
+            "window_size": state.window_size,
+            "predictions_served": state.predictions_served,
+        })
+
+    latest = state.drift_log[-1]
+    return JSONResponse({
+        "status":        "active",
+        "latest_check":  latest,
+        "total_checks":  len(state.drift_log),
+        "predictions_served": state.predictions_served,
+        "window_size":   state.window_size,
+    })
+
+
+@app.get("/window/stats", summary="Feature distribution statistics for the current window")
+async def window_stats():
+    """
+    Returns mean, std, min, max, p25, p50, p75 for every numerical feature
+    currently in the sliding window. Useful for manual drift inspection.
+    """
+    window_df = state.get_window_snapshot()
+    if window_df.empty:
+        return JSONResponse({"status": "empty", "message": "No predictions in window yet"})
+
+    stats = {}
+    for feat in model_config.numerical_features:
+        if feat in window_df.columns:
+            col = window_df[feat].dropna()
+            stats[feat] = {
+                "mean": round(float(col.mean()), 4),
+                "std":  round(float(col.std()), 4),
+                "min":  round(float(col.min()), 4),
+                "p25":  round(float(col.quantile(0.25)), 4),
+                "p50":  round(float(col.quantile(0.50)), 4),
+                "p75":  round(float(col.quantile(0.75)), 4),
+                "max":  round(float(col.max()), 4),
+            }
+
+    cat_stats = {}
+    for feat in model_config.categorical_features:
+        if feat in window_df.columns:
+            counts = window_df[feat].value_counts(normalize=True).round(4).to_dict()
+            cat_stats[feat] = counts
+
+    avg_pred = round(float(window_df["prediction_score"].mean()), 4) if "prediction_score" in window_df.columns else None
+    high_risk_pct = round(float((window_df["prediction_score"] >= 0.70).mean()) * 100, 1) if "prediction_score" in window_df.columns else None
+
+    return JSONResponse({
+        "window_size":        len(window_df),
+        "predictions_served": state.predictions_served,
+        "avg_churn_prob":     avg_pred,
+        "high_risk_pct":      high_risk_pct,
+        "numerical_stats":    stats,
+        "categorical_stats":  cat_stats,
+    })
+
+
+@app.delete("/window/reset", summary="Clear the feature sliding window (testing only)")
+async def reset_window():
+    """Clears the prediction window. Use during testing to start fresh."""
+    with state._lock:
+        state._window.clear()
+        state.predictions_served = 0
+        state.drift_log.clear()
+        state.last_drift_check = None
+        state.last_drift_severity = "none"
+    logger.info("Sliding window reset")
+    return JSONResponse({"status": "ok", "message": "Window cleared"})
