@@ -1,0 +1,961 @@
+"""
+dashboard.py — Real-Time ML Monitoring Dashboard (Plotly Dash)
+
+Tabs:
+  1. Overview       — KPI cards, status banner, alert feed
+  2. Drift Analysis — Per-feature drift scores, PSI heatmap, severity timeline
+  3. Performance    — AUC/F1 trend, prediction distribution, calibration
+  4. Alerts         — Full alert log with filtering
+  5. Retraining     — Retrain history, AUC improvement chart
+
+Run:
+    python -m src.dashboard.dashboard
+"""
+
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import dash
+from dash import dcc, html, Input, Output, dash_table
+import dash_bootstrap_components as dbc
+
+from src.config import MODELS_DIR, DASHBOARD_HOST, DASHBOARD_PORT
+
+# ── Colour palette ────────────────────────────────────────────────────────────
+COLORS = {
+    "none":     "#27ae60",
+    "warning":  "#f39c12",
+    "critical": "#e74c3c",
+    "bg":       "#0f1117",
+    "card":     "#1a1e2e",
+    "border":   "#2d3561",
+    "text":     "#e8eaf6",
+    "muted":    "#8892b0",
+    "blue":     "#378ADD",
+    "teal":     "#1D9E75",
+    "purple":   "#7F77DD",
+    "amber":    "#BA7517",
+}
+
+
+# ── Data loading ─────────────────────────────────────────────────────────────
+
+def load_data() -> dict:
+    data = {}
+    try:
+        p = MODELS_DIR / "monitoring_summary.json"
+        data["summary"] = pd.read_json(p) if p.exists() else pd.DataFrame()
+    except Exception:
+        data["summary"] = pd.DataFrame()
+
+    try:
+        p = MODELS_DIR / "performance_history.json"
+        data["performance"] = pd.read_json(p) if p.exists() else pd.DataFrame()
+    except Exception:
+        data["performance"] = pd.DataFrame()
+
+    try:
+        p = MODELS_DIR / "drift_details.json"
+        data["drift"] = pd.read_json(p) if p.exists() else pd.DataFrame()
+    except Exception:
+        data["drift"] = pd.DataFrame()
+
+    try:
+        p = MODELS_DIR / "alert_log.json"
+        if p.exists():
+            with open(p) as f:
+                data["alerts"] = pd.DataFrame(json.load(f))
+        else:
+            data["alerts"] = pd.DataFrame()
+    except Exception:
+        data["alerts"] = pd.DataFrame()
+
+    try:
+        p = MODELS_DIR / "retrain_log.json"
+        if p.exists():
+            with open(p) as f:
+                data["retrain"] = pd.DataFrame(json.load(f))
+        else:
+            data["retrain"] = pd.DataFrame()
+    except Exception:
+        data["retrain"] = pd.DataFrame()
+
+    try:
+        p = MODELS_DIR / "fleet_health.json"
+        data["fleet"] = pd.read_json(p) if p.exists() else pd.DataFrame()
+    except Exception:
+        data["fleet"] = pd.DataFrame()
+
+    return data
+
+
+# ── Chart builders ─────────────────────────────────────────────────────────
+
+def build_auc_trend_chart(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+
+    if df.empty:
+        return fig
+
+    # AUC line
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["auc_roc"],
+        mode="lines+markers", name="AUC-ROC",
+        line=dict(color=COLORS["blue"], width=2.5),
+        marker=dict(size=7, color=[
+            COLORS["critical"] if v < 0.70 else
+            COLORS["warning"]  if v < 0.80 else
+            COLORS["none"] for v in df["auc_roc"]
+        ])
+    ))
+
+    # F1 line
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["f1"],
+        mode="lines+markers", name="F1 Score",
+        line=dict(color=COLORS["teal"], width=2, dash="dot"),
+        marker=dict(size=5),
+    ))
+
+    # Threshold lines
+    fig.add_hline(y=0.80, line_dash="dash", line_color=COLORS["warning"],
+                  annotation_text="Warning (0.80)", annotation_position="right")
+    fig.add_hline(y=0.70, line_dash="dash", line_color=COLORS["critical"],
+                  annotation_text="Critical (0.70)", annotation_position="right")
+
+    # Shade retrain events
+    if "retrain_triggered" in df.columns:
+        for _, row in df[df["retrain_triggered"]].iterrows():
+            fig.add_vline(x=row["batch_id"], line_dash="dot",
+                          line_color=COLORS["purple"], opacity=0.6,
+                          annotation_text="Retrain", annotation_position="top")
+
+    fig.update_layout(
+        title="Model Performance Over Production Batches",
+        xaxis_title="Batch ID", yaxis_title="Score",
+        yaxis=dict(range=[0, 1.05]),
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        legend=dict(bgcolor=COLORS["card"], bordercolor=COLORS["border"]),
+        margin=dict(l=40, r=40, t=40, b=40),
+        hovermode="x unified",
+    )
+    return fig
+
+
+def build_drift_timeline_chart(df: pd.DataFrame) -> go.Figure:
+    if df.empty:
+        return go.Figure()
+
+    severity_map = {"none": 0, "warning": 1, "critical": 2}
+    color_map    = {0: COLORS["none"], 1: COLORS["warning"], 2: COLORS["critical"]}
+
+    fig = go.Figure()
+    if "drift_score" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["batch_id"], y=df["drift_score"],
+            fill="tozeroy", fillcolor="rgba(55,138,221,0.15)",
+            line=dict(color=COLORS["blue"], width=2),
+            name="Overall Drift Score",
+            mode="lines+markers",
+            marker=dict(size=8, color=[
+                color_map.get(severity_map.get(s, 0), COLORS["none"])
+                for s in df.get("drift_severity", ["none"] * len(df))
+            ])
+        ))
+
+        fig.add_hline(y=0.10, line_dash="dash", line_color=COLORS["warning"],
+                      annotation_text="Warning (PSI 0.10)")
+        fig.add_hline(y=0.20, line_dash="dash", line_color=COLORS["critical"],
+                      annotation_text="Critical (PSI 0.20)")
+
+    fig.update_layout(
+        title="Overall Drift Score Timeline",
+        xaxis_title="Batch ID", yaxis_title="Drift Score (PSI)",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=40, r=40, t=40, b=40),
+    )
+    return fig
+
+
+def build_psi_heatmap(drift_df: pd.DataFrame) -> go.Figure:
+    if drift_df.empty:
+        return go.Figure()
+
+    num_features = [
+        "tenure", "monthly_charges", "total_charges", "num_products",
+        "num_support_calls", "avg_call_duration", "days_since_last_login",
+        "data_usage_gb", "billing_amount_variance", "customer_lifetime_value"
+    ]
+    available = [f for f in num_features if f in drift_df["feature"].values]
+    if not available:
+        return go.Figure()
+
+    filtered = drift_df[drift_df["feature"].isin(available)]
+    pivot = filtered.pivot_table(
+        index="feature", columns="batch_id", values="score", aggfunc="mean"
+    ).fillna(0)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=[f"Batch {c}" for c in pivot.columns],
+        y=pivot.index.tolist(),
+        colorscale=[
+            [0.0,  "#1a1e2e"],
+            [0.05, "#27ae60"],
+            [0.10, "#f39c12"],
+            [0.20, "#e74c3c"],
+            [1.0,  "#8b0000"],
+        ],
+        colorbar=dict(title="PSI Score"),
+        hovertemplate="Feature: %{y}<br>%{x}<br>PSI: %{z:.4f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title="Feature Drift Heatmap (PSI by Batch)",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=140, r=40, t=40, b=60),
+        xaxis=dict(tickangle=-30),
+    )
+    return fig
+
+
+def build_precision_recall_chart(df: pd.DataFrame) -> go.Figure:
+    if df.empty:
+        return go.Figure()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["precision"],
+        mode="lines+markers", name="Precision",
+        line=dict(color=COLORS["teal"]),
+    ))
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["recall"],
+        mode="lines+markers", name="Recall",
+        line=dict(color=COLORS["amber"]),
+    ))
+    fig.add_trace(go.Bar(
+        x=df["batch_id"], y=df["churn_rate_true"],
+        name="True Churn Rate", opacity=0.3,
+        marker_color=COLORS["purple"],
+    ), secondary_y=True)
+
+    fig.update_layout(
+        title="Precision, Recall & Churn Rate",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=40, r=60, t=40, b=40),
+        legend=dict(bgcolor=COLORS["card"]),
+    )
+    fig.update_yaxes(title_text="Score", range=[0, 1.05], secondary_y=False)
+    fig.update_yaxes(title_text="Churn Rate", range=[0, 0.5], secondary_y=True)
+    return fig
+
+
+# ── ROI Chart builders ────────────────────────────────────────────────────────
+
+def build_roi_loss_chart(df: pd.DataFrame) -> go.Figure:
+    """Stacked bar: monthly revenue at risk + wasted outreach per batch."""
+    if df.empty or "roi_revenue_at_risk" not in df.columns:
+        return go.Figure()
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df["batch_id"], y=df["roi_revenue_at_risk"],
+        name="Revenue at risk", marker_color="#E24B4A", opacity=0.85,
+    ))
+    fig.add_trace(go.Bar(
+        x=df["batch_id"], y=df["roi_wasted_outreach"],
+        name="Wasted outreach", marker_color="#EF9F27", opacity=0.85,
+    ))
+    fig.update_layout(
+        barmode="stack",
+        title="Estimated Monthly Business Loss per Batch (₹)",
+        xaxis_title="Batch ID", yaxis_title="Loss (₹)",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        legend=dict(bgcolor=COLORS["card"]),
+        margin=dict(l=60, r=40, t=40, b=40),
+    )
+    return fig
+
+
+def build_roi_churner_chart(df: pd.DataFrame) -> go.Figure:
+    """Line chart: missed churners per batch overlaid with AUC."""
+    if df.empty or "roi_missed_churners" not in df.columns:
+        return go.Figure()
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["roi_missed_churners"],
+        name="Missed churners/mo", mode="lines+markers",
+        line=dict(color="#E24B4A", width=2.5),
+        marker=dict(size=7),
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=df["auc_roc"],
+        name="AUC-ROC", mode="lines+markers",
+        line=dict(color=COLORS["blue"], width=2, dash="dot"),
+        marker=dict(size=5),
+    ), secondary_y=True)
+    fig.update_layout(
+        title="Missed Churners vs Model AUC per Batch",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        legend=dict(bgcolor=COLORS["card"]),
+        margin=dict(l=60, r=60, t=40, b=40),
+    )
+    fig.update_yaxes(title_text="Missed churners", secondary_y=False)
+    fig.update_yaxes(title_text="AUC-ROC", range=[0.5, 1.0], secondary_y=True)
+    return fig
+
+
+def build_roi_cumulative_chart(df: pd.DataFrame) -> go.Figure:
+    """Cumulative annual loss projection across the monitoring window."""
+    if df.empty or "roi_total_monthly_loss" not in df.columns:
+        return go.Figure()
+
+    cumulative = df["roi_total_monthly_loss"].cumsum()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["batch_id"], y=cumulative,
+        fill="tozeroy", fillcolor="rgba(226,75,74,0.12)",
+        line=dict(color="#E24B4A", width=2.5),
+        name="Cumulative loss (₹)",
+    ))
+    fig.update_layout(
+        title="Cumulative Estimated Loss Across All Batches (₹)",
+        xaxis_title="Batch ID", yaxis_title="Cumulative Loss (₹)",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=60, r=40, t=40, b=40),
+    )
+    return fig
+
+
+# ── Fleet Health Chart builder ────────────────────────────────────────────────
+
+def build_fleet_status_chart(fleet_df: pd.DataFrame) -> go.Figure:
+    """Horizontal bar showing latest AUC per model, coloured by health status."""
+    if fleet_df.empty or "latest_auc" not in fleet_df.columns:
+        return go.Figure()
+
+    df = fleet_df.dropna(subset=["latest_auc"]).copy()
+    if df.empty:
+        return go.Figure()
+
+    color_map = {
+        "healthy":  COLORS["none"],
+        "warning":  COLORS["amber"],
+        "critical": COLORS["critical"],
+        "inactive": COLORS["muted"],
+        "unknown":  COLORS["muted"],
+    }
+    bar_colors = [color_map.get(s, COLORS["muted"]) for s in df.get("status", ["unknown"] * len(df))]
+
+    fig = go.Figure(go.Bar(
+        x=df["latest_auc"],
+        y=df["name"],
+        orientation="h",
+        marker_color=bar_colors,
+        text=[f"{v:.4f}" for v in df["latest_auc"]],
+        textposition="outside",
+        customdata=df[["version", "status", "n_batches"]].values,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "AUC: %{x:.4f}<br>"
+            "Version: %{customdata[0]}<br>"
+            "Status: %{customdata[1]}<br>"
+            "Batches logged: %{customdata[2]}<extra></extra>"
+        ),
+    ))
+    fig.add_vline(x=0.80, line_dash="dash", line_color=COLORS["warning"],
+                  annotation_text="Warning (0.80)", annotation_position="top right")
+    fig.add_vline(x=0.70, line_dash="dash", line_color=COLORS["critical"],
+                  annotation_text="Critical (0.70)", annotation_position="top right")
+    fig.update_xaxes(range=[0.5, 1.05])
+    fig.update_layout(
+        title="Fleet — Latest AUC by Model",
+        xaxis_title="AUC-ROC",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=160, r=80, t=40, b=40),
+        height=max(200, len(df) * 70),
+    )
+    return fig
+
+
+def build_fleet_roi_chart(fleet_df: pd.DataFrame) -> go.Figure:
+    """Bar chart of estimated monthly ROI loss per model."""
+    if fleet_df.empty or "roi_monthly_loss" not in fleet_df.columns:
+        return go.Figure()
+
+    df = fleet_df.dropna(subset=["roi_monthly_loss"]).copy()
+    if df.empty:
+        return go.Figure()
+
+    fig = go.Figure(go.Bar(
+        x=df["name"],
+        y=df["roi_monthly_loss"],
+        marker_color=[
+            COLORS["critical"] if v > 50000 else
+            COLORS["amber"]    if v > 10000 else
+            COLORS["none"]
+            for v in df["roi_monthly_loss"]
+        ],
+        text=[f"₹{v:,.0f}" for v in df["roi_monthly_loss"]],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title="Estimated Monthly Loss by Model (₹)",
+        xaxis_title="Model", yaxis_title="Loss (₹)",
+        plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+        font=dict(color=COLORS["text"]),
+        margin=dict(l=60, r=60, t=40, b=60),
+    )
+    return fig
+
+
+# ── KPI Card builder ──────────────────────────────────────────────────────────
+
+def make_kpi_card(title: str, value: str, badge: str, badge_color: str) -> dbc.Card:
+    return dbc.Card([
+        dbc.CardBody([
+            html.P(title, className="text-muted mb-1", style={"fontSize": "12px"}),
+            html.H4(value, style={"color": COLORS["text"], "fontFamily": "monospace"}),
+            dbc.Badge(badge, color=badge_color, pill=True, style={"fontSize": "11px"}),
+        ])
+    ], style={"background": COLORS["card"], "border": f"1px solid {COLORS['border']}",
+              "borderRadius": "10px"})
+
+
+# ── App layout ────────────────────────────────────────────────────────────────
+
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.CYBORG],
+    title="ML Monitor Dashboard",
+    suppress_callback_exceptions=True,
+)
+
+NAV = dbc.NavbarSimple(
+    children=[
+        dbc.NavItem(dbc.NavLink("Docs", href="https://github.com")),
+    ],
+    brand="⚡ ML Monitoring System",
+    brand_style={"fontWeight": "700", "fontSize": "18px"},
+    color=COLORS["card"],
+    dark=True,
+    style={"borderBottom": f"1px solid {COLORS['border']}"},
+)
+
+app.layout = html.Div([
+    NAV,
+    dbc.Container([
+        # Refresh interval
+        dcc.Interval(id="refresh", interval=10_000, n_intervals=0),
+
+        # Status banner
+        html.Div(id="status-banner", className="my-3"),
+
+        # KPI row
+        dbc.Row(id="kpi-row", className="mb-3 g-3"),
+
+        # Tabs
+        dbc.Tabs([
+            dbc.Tab(label="📊 Overview",       tab_id="tab-overview"),
+            dbc.Tab(label="🌊 Drift Analysis", tab_id="tab-drift"),
+            dbc.Tab(label="🎯 Performance",    tab_id="tab-perf"),
+            dbc.Tab(label="💰 ROI Impact",     tab_id="tab-roi"),
+            dbc.Tab(label="🚦 Fleet Health",   tab_id="tab-fleet"),
+            dbc.Tab(label="🔔 Alerts",         tab_id="tab-alerts"),
+            dbc.Tab(label="🔄 Retraining",     tab_id="tab-retrain"),
+        ], id="tabs", active_tab="tab-overview", className="mb-3"),
+
+        html.Div(id="tab-content"),
+    ], fluid=True),
+], style={"background": COLORS["bg"], "minHeight": "100vh", "color": COLORS["text"]})
+
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("status-banner", "children"),
+    Output("kpi-row", "children"),
+    Input("refresh", "n_intervals"),
+)
+def update_header(n):
+    data = load_data()
+    df = data["summary"]
+    alerts_df = data["alerts"]
+
+    if df.empty:
+        banner = dbc.Alert(
+            "⏳ No monitoring data found. Run the monitoring loop first: python -m src.monitoring.monitoring_loop",
+            color="warning"
+        )
+        return banner, []
+
+    latest = df.iloc[-1]
+    severity = latest.get("drift_severity", "none")
+    banner_color = {"none": "success", "warning": "warning", "critical": "danger"}.get(severity, "secondary")
+    banner_text  = {
+        "none":     "✅ System Healthy — No drift detected",
+        "warning":  f"⚠️  Warning — Drift detected in {latest.get('n_drifted_feats', '?')} feature(s)",
+        "critical": f"🔴 Critical — Significant drift | Batch {int(latest['batch_id'])}",
+    }.get(severity, "ℹ️  Monitoring active")
+
+    banner = dbc.Alert(banner_text, color=banner_color,
+                       style={"fontWeight": "600", "borderRadius": "8px"})
+
+    # KPI cards — pull ROI figures from latest batch if available
+    n_critical = len(alerts_df[alerts_df["severity"] == "CRITICAL"]) if not alerts_df.empty else 0
+    n_warning  = len(alerts_df[alerts_df["severity"] == "WARNING"])  if not alerts_df.empty else 0
+    retrain_df = data["retrain"]
+    n_retrains = len(retrain_df) if not retrain_df.empty else 0
+
+    latest_auc = f"{df['auc_roc'].iloc[-1]:.4f}" if "auc_roc" in df.columns else "—"
+    latest_f1  = f"{df['f1'].iloc[-1]:.4f}"      if "f1"      in df.columns else "—"
+
+    # ── ROI KPI values ─────────────────────────────────────────────────────
+    def _fmt_currency(val):
+        if val >= 1_00_000:
+            return f"₹{val/1_00_000:.1f}L"
+        return f"₹{val:,.0f}"
+
+    if "roi_total_monthly_loss" in df.columns and df["roi_total_monthly_loss"].iloc[-1] > 0:
+        monthly_loss    = df["roi_total_monthly_loss"].iloc[-1]
+        annual_loss     = df["roi_total_annual_loss"].iloc[-1]
+        missed_churners = int(df["roi_missed_churners"].iloc[-1])
+        roi_status      = df["roi_status"].iloc[-1]
+        roi_badge_color = {"healthy": "success", "warning": "warning", "critical": "danger"}.get(roi_status, "secondary")
+        monthly_str     = _fmt_currency(monthly_loss)
+        annual_str      = _fmt_currency(annual_loss)
+        churner_str     = str(missed_churners)
+    else:
+        monthly_str = annual_str = churner_str = "—"
+        roi_badge_color = "success"
+
+    kpis = [
+        dbc.Col(make_kpi_card("Latest AUC-ROC",      latest_auc,    "Live",    "primary"),  width=2),
+        dbc.Col(make_kpi_card("Latest F1",            latest_f1,     "Live",    "info"),     width=2),
+        dbc.Col(make_kpi_card("Est. Monthly Loss",    monthly_str,   "ROI",     roi_badge_color), width=2),
+        dbc.Col(make_kpi_card("Est. Annual Loss",     annual_str,    "ROI",     roi_badge_color), width=2),
+        dbc.Col(make_kpi_card("Missed Churners/mo",   churner_str,   "ROI",     roi_badge_color), width=2),
+        dbc.Col(make_kpi_card("Retraining Runs",      str(n_retrains), "Total", "primary"),  width=2),
+    ]
+    return banner, kpis
+
+
+@app.callback(Output("tab-content", "children"), Input("tabs", "active_tab"), Input("refresh", "n_intervals"))
+def render_tab(tab, n):
+    data = load_data()
+    df   = data["summary"]
+    drift_df = data["drift"]
+
+    if tab == "tab-overview":
+        return dbc.Row([
+            dbc.Col(dcc.Graph(figure=build_auc_trend_chart(df),   config={"displayModeBar": False}), md=6),
+            dbc.Col(dcc.Graph(figure=build_drift_timeline_chart(df), config={"displayModeBar": False}), md=6),
+            dbc.Col(dcc.Graph(figure=build_precision_recall_chart(df), config={"displayModeBar": False}), md=12),
+        ])
+
+    elif tab == "tab-drift":
+        # Feature drift bar chart — latest batch
+        if not drift_df.empty:
+            latest_batch = drift_df["batch_id"].max()
+            latest_drift = drift_df[drift_df["batch_id"] == latest_batch].copy()
+            latest_drift = latest_drift.sort_values("score", ascending=True)
+
+            bar_fig = go.Figure(go.Bar(
+                x=latest_drift["score"],
+                y=latest_drift["feature"],
+                orientation="h",
+                marker_color=[
+                    COLORS["critical"] if v > 0.20 else
+                    COLORS["warning"]  if v > 0.10 else
+                    COLORS["none"]
+                    for v in latest_drift["score"]
+                ],
+                text=[f"{v:.4f}" for v in latest_drift["score"]],
+                textposition="outside",
+            ))
+            bar_fig.add_vline(x=0.10, line_dash="dash", line_color=COLORS["warning"])
+            bar_fig.add_vline(x=0.20, line_dash="dash", line_color=COLORS["critical"])
+            bar_fig.update_layout(
+                title=f"Feature Drift Scores — Batch {int(latest_batch)}",
+                xaxis_title="Drift Score (PSI / Chi2-stat)",
+                plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+                font=dict(color=COLORS["text"]),
+                margin=dict(l=160, r=80, t=40, b=40),
+            )
+
+            table_cols = ["feature", "method", "score", "p_value", "severity", "is_drifted", "message"]
+            table_cols = [c for c in table_cols if c in latest_drift.columns]
+
+            return html.Div([
+                dbc.Row([
+                    dbc.Col(dcc.Graph(figure=bar_fig, config={"displayModeBar": False}), md=6),
+                    dbc.Col(dcc.Graph(figure=build_psi_heatmap(drift_df), config={"displayModeBar": False}), md=6),
+                ]),
+                html.H6("Drift Details — Latest Batch", className="mt-3 text-muted"),
+                dash_table.DataTable(
+                    data=latest_drift[table_cols].round(4).to_dict("records"),
+                    columns=[{"name": c, "id": c} for c in table_cols],
+                    style_table={"overflowX": "auto"},
+                    style_cell={"background": COLORS["card"], "color": COLORS["text"],
+                                "border": f"1px solid {COLORS['border']}", "fontSize": "12px",
+                                "padding": "6px 10px"},
+                    style_header={"background": COLORS["border"], "fontWeight": "600"},
+                    style_data_conditional=[
+                        {"if": {"filter_query": '{severity} = "critical"'},
+                         "backgroundColor": "#3d1515", "color": COLORS["critical"]},
+                        {"if": {"filter_query": '{severity} = "warning"'},
+                         "backgroundColor": "#3d2a00", "color": COLORS["amber"]},
+                    ],
+                    page_size=16,
+                )
+            ])
+        return dbc.Alert("No drift data available yet.", color="secondary")
+
+    elif tab == "tab-perf":
+        perf_df = data["performance"]
+        if not perf_df.empty and "brier_score" in perf_df.columns:
+            brier_fig = go.Figure(go.Scatter(
+                x=perf_df["batch_id"], y=perf_df["brier_score"],
+                fill="tozeroy", fillcolor="rgba(127,119,221,0.15)",
+                line=dict(color=COLORS["purple"]),
+                name="Brier Score",
+            ))
+            brier_fig.update_layout(
+                title="Brier Score (Calibration Quality)",
+                xaxis_title="Batch ID", yaxis_title="Brier Score (lower = better)",
+                plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+                font=dict(color=COLORS["text"]),
+                margin=dict(l=40, r=40, t=40, b=40),
+            )
+        else:
+            brier_fig = go.Figure()
+
+        return dbc.Row([
+            dbc.Col(dcc.Graph(figure=build_auc_trend_chart(df), config={"displayModeBar": False}), md=12),
+            dbc.Col(dcc.Graph(figure=build_precision_recall_chart(df), config={"displayModeBar": False}), md=6),
+            dbc.Col(dcc.Graph(figure=brier_fig, config={"displayModeBar": False}), md=6),
+        ])
+
+    elif tab == "tab-roi":
+        if df.empty or "roi_total_monthly_loss" not in df.columns:
+            return dbc.Alert(
+                "No ROI data yet. Run the monitoring loop first: "
+                "python -m src.monitoring.monitoring_loop",
+                color="secondary",
+            )
+
+        # Latest ROI headline
+        latest = df.iloc[-1]
+        roi_status = latest.get("roi_status", "healthy")
+        headline   = latest.get("roi_headline", "")
+        status_color = {"healthy": "success", "warning": "warning", "critical": "danger"}.get(roi_status, "secondary")
+
+        def _fmt(v):
+            if v >= 1_00_000:
+                return f"₹{v/1_00_000:.1f}L"
+            return f"₹{v:,.0f}"
+
+        total_cumulative = df["roi_total_monthly_loss"].sum()
+        max_monthly      = df["roi_total_monthly_loss"].max()
+        total_missed     = int(df["roi_missed_churners"].sum())
+        worst_batch      = int(df.loc[df["roi_total_monthly_loss"].idxmax(), "batch_id"])
+
+        return html.Div([
+            # Headline alert
+            dbc.Alert(headline, color=status_color,
+                      style={"fontWeight": "600", "borderRadius": "8px", "marginBottom": "1rem"}),
+
+            # Summary metric row
+            dbc.Row([
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.P("Total loss (all batches)", className="text-muted mb-1", style={"fontSize": "12px"}),
+                    html.H4(_fmt(total_cumulative), style={"color": "#E24B4A", "fontFamily": "monospace"}),
+                    dbc.Badge("Cumulative", color="danger", pill=True, style={"fontSize": "11px"}),
+                ]), style={"background": COLORS["card"], "border": f"1px solid {COLORS['border']}", "borderRadius": "10px"}), width=3),
+
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.P("Worst single batch loss", className="text-muted mb-1", style={"fontSize": "12px"}),
+                    html.H4(_fmt(max_monthly), style={"color": COLORS["amber"], "fontFamily": "monospace"}),
+                    dbc.Badge(f"Batch {worst_batch}", color="warning", pill=True, style={"fontSize": "11px"}),
+                ]), style={"background": COLORS["card"], "border": f"1px solid {COLORS['border']}", "borderRadius": "10px"}), width=3),
+
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.P("Total missed churners", className="text-muted mb-1", style={"fontSize": "12px"}),
+                    html.H4(f"{total_missed:,}", style={"color": COLORS["text"], "fontFamily": "monospace"}),
+                    dbc.Badge("All batches", color="secondary", pill=True, style={"fontSize": "11px"}),
+                ]), style={"background": COLORS["card"], "border": f"1px solid {COLORS['border']}", "borderRadius": "10px"}), width=3),
+
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.P("Projected annual loss", className="text-muted mb-1", style={"fontSize": "12px"}),
+                    html.H4(_fmt(df["roi_total_annual_loss"].iloc[-1]),
+                            style={"color": "#E24B4A", "fontFamily": "monospace"}),
+                    dbc.Badge("Annualised", color="danger", pill=True, style={"fontSize": "11px"}),
+                ]), style={"background": COLORS["card"], "border": f"1px solid {COLORS['border']}", "borderRadius": "10px"}), width=3),
+            ], className="mb-3 g-3"),
+
+            # Charts
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=build_roi_loss_chart(df),       config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=build_roi_churner_chart(df),    config={"displayModeBar": False}), md=6),
+            ], className="mb-3"),
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=build_roi_cumulative_chart(df), config={"displayModeBar": False}), md=12),
+            ]),
+
+            # Per-batch ROI table
+            html.H6("Per-Batch ROI Breakdown", className="mt-3 text-muted"),
+            dash_table.DataTable(
+                data=df[[
+                    "batch_id", "auc_roc", "roi_auc_drop",
+                    "roi_missed_churners", "roi_revenue_at_risk",
+                    "roi_wasted_outreach", "roi_total_monthly_loss",
+                    "roi_status", "roi_headline",
+                ]].round(4).to_dict("records"),
+                columns=[
+                    {"name": "Batch",          "id": "batch_id"},
+                    {"name": "AUC",            "id": "auc_roc"},
+                    {"name": "AUC Drop",       "id": "roi_auc_drop"},
+                    {"name": "Missed Churners","id": "roi_missed_churners"},
+                    {"name": "Revenue Risk (₹)","id": "roi_revenue_at_risk"},
+                    {"name": "Wasted Spend (₹)","id": "roi_wasted_outreach"},
+                    {"name": "Monthly Loss (₹)","id": "roi_total_monthly_loss"},
+                    {"name": "Status",         "id": "roi_status"},
+                    {"name": "Headline",       "id": "roi_headline"},
+                ],
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "background": COLORS["card"], "color": COLORS["text"],
+                    "border": f"1px solid {COLORS['border']}", "fontSize": "12px",
+                    "padding": "6px 10px", "whiteSpace": "normal", "height": "auto",
+                },
+                style_header={"background": COLORS["border"], "fontWeight": "600"},
+                style_data_conditional=[
+                    {"if": {"filter_query": '{roi_status} = "critical"'},
+                     "backgroundColor": "#3d1515", "color": COLORS["critical"]},
+                    {"if": {"filter_query": '{roi_status} = "warning"'},
+                     "backgroundColor": "#3d2a00", "color": COLORS["amber"]},
+                ],
+                page_size=16,
+                sort_action="native",
+            ),
+        ])
+
+    elif tab == "tab-fleet":
+        fleet_df = data.get("fleet", pd.DataFrame())
+        if fleet_df.empty:
+            return dbc.Alert(
+                "No fleet data yet. Run the monitoring loop first: "
+                "python -m src.monitoring.monitoring_loop  "
+                "(or run: python scripts/db_migrate.py to register models)",
+                color="secondary",
+            )
+
+        # ── Summary badges ────────────────────────────────────────────
+        n_healthy  = int((fleet_df.get("status", pd.Series()) == "healthy").sum())
+        n_warning  = int((fleet_df.get("status", pd.Series()) == "warning").sum())
+        n_critical = int((fleet_df.get("status", pd.Series()) == "critical").sum())
+        n_inactive = int((fleet_df.get("status", pd.Series()) == "inactive").sum())
+
+        status_badge = lambda label, count, color: dbc.Col(
+            dbc.Card(dbc.CardBody([
+                html.P(label, className="text-muted mb-1", style={"fontSize": "12px"}),
+                html.H4(str(count), style={"color": COLORS["text"], "fontFamily": "monospace"}),
+            ]), style={"background": COLORS["card"],
+                       "border": f"1px solid {COLORS['border']}",
+                       "borderRadius": "10px"}),
+            width=3,
+        )
+
+        # ── Per-model cards ───────────────────────────────────────────
+        model_cards = []
+        for _, row in fleet_df.iterrows():
+            status   = row.get("status", "unknown")
+            s_color  = {"healthy": "success", "warning": "warning",
+                        "critical": "danger", "inactive": "secondary"}.get(status, "secondary")
+            auc_val  = f"{row['latest_auc']:.4f}" if pd.notna(row.get("latest_auc")) else "—"
+            f1_val   = f"{row['latest_f1']:.4f}"  if pd.notna(row.get("latest_f1"))  else "—"
+            loss_val = f"₹{row['roi_monthly_loss']:,.0f}" if pd.notna(row.get("roi_monthly_loss")) and row.get("roi_monthly_loss", 0) > 0 else "₹0"
+            n_batches = int(row.get("n_batches") or 0)
+            n_retrains = int(row.get("n_retrains") or 0)
+            drift_sev = row.get("drift_severity", "none")
+
+            card = dbc.Col(dbc.Card([
+                dbc.CardHeader([
+                    html.Span(row.get("name", "—"), style={"fontWeight": "700", "fontSize": "14px"}),
+                    dbc.Badge(f"v{row.get('version', '?')}",
+                              color="secondary", pill=True,
+                              style={"marginLeft": "8px", "fontSize": "10px"}),
+                    dbc.Badge(status.upper(), color=s_color, pill=True,
+                              style={"marginLeft": "6px", "fontSize": "10px", "float": "right"}),
+                ], style={"background": COLORS["card"],
+                          "borderBottom": f"1px solid {COLORS['border']}",
+                          "padding": "10px 14px"}),
+                dbc.CardBody([
+                    html.P(row.get("description", ""), className="text-muted",
+                           style={"fontSize": "11px", "marginBottom": "10px"}),
+                    dbc.Row([
+                        dbc.Col([html.Small("AUC-ROC", className="text-muted"),
+                                 html.P(auc_val, style={"fontFamily": "monospace", "fontSize": "18px", "margin": "0"})], width=4),
+                        dbc.Col([html.Small("F1 Score", className="text-muted"),
+                                 html.P(f1_val,  style={"fontFamily": "monospace", "fontSize": "18px", "margin": "0"})], width=4),
+                        dbc.Col([html.Small("Monthly Loss", className="text-muted"),
+                                 html.P(loss_val, style={"fontFamily": "monospace", "fontSize": "16px",
+                                                         "color": COLORS["critical"] if row.get("roi_monthly_loss", 0) > 20000 else COLORS["text"],
+                                                         "margin": "0"})], width=4),
+                    ], className="mb-2"),
+                    html.Hr(style={"borderColor": COLORS["border"], "margin": "8px 0"}),
+                    dbc.Row([
+                        dbc.Col(html.Small(f"Batches: {n_batches}", className="text-muted"), width=4),
+                        dbc.Col(html.Small(f"Retrains: {n_retrains}", className="text-muted"), width=4),
+                        dbc.Col(html.Small(f"Drift: {drift_sev}", className="text-muted",
+                                           style={"color": COLORS["critical"] if drift_sev == "critical"
+                                                  else COLORS["amber"] if drift_sev == "warning"
+                                                  else COLORS["muted"]}), width=4),
+                    ]),
+                ], style={"padding": "12px 14px"}),
+            ], style={"background": COLORS["card"],
+                      "border": f"1px solid {COLORS['border']}",
+                      "borderRadius": "10px",
+                      "marginBottom": "8px"}),
+            md=6 if len(fleet_df) > 1 else 12)
+
+            model_cards.append(card)
+
+        # ── Full fleet table ──────────────────────────────────────────
+        table_cols = [c for c in [
+            "model_id", "name", "version", "status",
+            "latest_auc", "latest_f1", "drift_severity",
+            "last_batch_id", "n_batches", "n_retrains",
+            "roi_monthly_loss", "description",
+        ] if c in fleet_df.columns]
+
+        return html.Div([
+            # Status summary row
+            dbc.Row([
+                status_badge("Healthy models",  n_healthy,  "success"),
+                status_badge("Warning models",  n_warning,  "warning"),
+                status_badge("Critical models", n_critical, "danger"),
+                status_badge("Inactive models", n_inactive, "secondary"),
+            ], className="mb-3 g-3"),
+
+            # Model cards grid
+            dbc.Row(model_cards, className="mb-3"),
+
+            # Charts row
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=build_fleet_status_chart(fleet_df), config={"displayModeBar": False}), md=6),
+                dbc.Col(dcc.Graph(figure=build_fleet_roi_chart(fleet_df),    config={"displayModeBar": False}), md=6),
+            ], className="mb-3"),
+
+            # Full fleet table
+            html.H6("Full Fleet Registry", className="mt-2 text-muted"),
+            dash_table.DataTable(
+                data=fleet_df[table_cols].round(4).to_dict("records"),
+                columns=[{"name": c.replace("_", " ").title(), "id": c} for c in table_cols],
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "background": COLORS["card"], "color": COLORS["text"],
+                    "border": f"1px solid {COLORS['border']}", "fontSize": "12px",
+                    "padding": "6px 10px", "whiteSpace": "normal", "height": "auto",
+                },
+                style_header={"background": COLORS["border"], "fontWeight": "600"},
+                style_data_conditional=[
+                    {"if": {"filter_query": '{status} = "critical"'},
+                     "backgroundColor": "#3d1515", "color": COLORS["critical"]},
+                    {"if": {"filter_query": '{status} = "warning"'},
+                     "backgroundColor": "#3d2a00", "color": COLORS["amber"]},
+                    {"if": {"filter_query": '{status} = "healthy"'},
+                     "backgroundColor": "#0d2e1a", "color": COLORS["none"]},
+                ],
+                sort_action="native",
+                page_size=20,
+            ),
+        ])
+
+    elif tab == "tab-alerts":
+        alerts_df = data["alerts"]
+        if alerts_df.empty:
+            return dbc.Alert("No alerts yet.", color="secondary")
+
+        cols = ["timestamp", "severity", "category", "batch_id", "title", "message"]
+        cols = [c for c in cols if c in alerts_df.columns]
+        return dash_table.DataTable(
+            data=alerts_df[cols].sort_values("timestamp", ascending=False).to_dict("records"),
+            columns=[{"name": c, "id": c} for c in cols],
+            style_table={"overflowX": "auto"},
+            style_cell={"background": COLORS["card"], "color": COLORS["text"],
+                        "border": f"1px solid {COLORS['border']}", "fontSize": "12px",
+                        "padding": "6px 10px", "whiteSpace": "normal", "height": "auto"},
+            style_header={"background": COLORS["border"], "fontWeight": "600"},
+            style_data_conditional=[
+                {"if": {"filter_query": '{severity} = "CRITICAL"'},
+                 "backgroundColor": "#3d1515"},
+                {"if": {"filter_query": '{severity} = "WARNING"'},
+                 "backgroundColor": "#3d2a00"},
+            ],
+            page_size=20,
+            filter_action="native",
+            sort_action="native",
+        )
+
+    elif tab == "tab-retrain":
+        retrain_df = data["retrain"]
+        if retrain_df.empty:
+            return dbc.Alert("No retraining events recorded yet.", color="secondary")
+
+        fig = go.Figure()
+        if "triggered_at_batch" in retrain_df.columns:
+            fig.add_trace(go.Scatter(
+                x=retrain_df["triggered_at_batch"], y=retrain_df["old_auc"],
+                name="Old AUC", mode="markers+lines",
+                marker=dict(symbol="x", size=10, color=COLORS["critical"]),
+            ))
+            fig.add_trace(go.Scatter(
+                x=retrain_df["triggered_at_batch"], y=retrain_df["new_auc"],
+                name="New AUC", mode="markers+lines",
+                marker=dict(symbol="circle", size=10, color=COLORS["none"]),
+            ))
+            fig.update_layout(
+                title="Retraining Events: Old vs New Model AUC",
+                xaxis_title="Trigger Batch", yaxis_title="Holdout AUC",
+                plot_bgcolor=COLORS["card"], paper_bgcolor=COLORS["card"],
+                font=dict(color=COLORS["text"]),
+                margin=dict(l=40, r=40, t=40, b=40),
+            )
+
+        cols = [c for c in ["triggered_at_batch", "old_auc", "new_auc", "promoted",
+                             "trigger_reason", "promotion_reason"] if c in retrain_df.columns]
+        return html.Div([
+            dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            html.H6("Retraining Log", className="mt-3 text-muted"),
+            dash_table.DataTable(
+                data=retrain_df[cols].to_dict("records"),
+                columns=[{"name": c, "id": c} for c in cols],
+                style_table={"overflowX": "auto"},
+                style_cell={"background": COLORS["card"], "color": COLORS["text"],
+                            "border": f"1px solid {COLORS['border']}", "fontSize": "12px",
+                            "padding": "6px 10px", "whiteSpace": "normal", "height": "auto"},
+                style_header={"background": COLORS["border"], "fontWeight": "600"},
+                page_size=10,
+            )
+        ])
+
+    return html.Div("Select a tab")
+
+
+if __name__ == "__main__":
+    app.run(host=DASHBOARD_HOST, port=DASHBOARD_PORT, debug=DASHBOARD_DEBUG)
