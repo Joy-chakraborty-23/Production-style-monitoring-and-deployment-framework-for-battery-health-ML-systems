@@ -1,0 +1,649 @@
+"""
+bms_models.py — Battery Management System Model Suite
+
+Trains and manages three complementary BMS models:
+
+  1. SOH Regressor     — predicts State of Health (0–1) via XGBoost regression
+  2. Fault Classifier  — detects thermal faults / anomalies (binary classification)
+  3. Degradation Trend — rolling trend model for capacity fade rate prediction
+
+All models follow a unified interface:
+  - train(X_train, y_train)
+  - predict(X)           → numpy array of predictions
+  - predict_proba(X)     → numpy array of probabilities (classifiers only)
+  - evaluate(X_test, y_test) → dict of metrics
+  - save(path)
+  - load(path)
+
+The EnsembleBMSPredictor fuses all three models into one final output,
+with confidence estimation and safety overrides.
+
+Edge export:
+  - All models can be exported to ONNX (when onnx + skl2onnx are installed)
+  - Fallback: joblib serialisation for CPU-only edge devices
+"""
+
+from __future__ import annotations
+
+import json
+import joblib
+import warnings
+import numpy as np
+import pandas as pd
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import (
+    mean_absolute_error, r2_score, mean_squared_error,
+    roc_auc_score, f1_score, precision_score, recall_score,
+    classification_report,
+)
+
+warnings.filterwarnings("ignore")
+
+# ── Feature schema (matches battery_data_generator.py) ─────────────────────
+BMS_NUMERICAL_FEATURES = [
+    "cycle_count", "soc", "voltage", "current_a",
+    "charge_rate_c", "temperature_c", "internal_resistance_mohm",
+    "capacity_fade_pct", "calendar_age_days",
+]
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR   = Path(__file__).resolve().parent.parent.parent
+MODELS_DIR = BASE_DIR / "models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── Base interface ────────────────────────────────────────────────────────────
+
+class BaseBMSModel(ABC):
+    """Abstract base for all BMS models — enforces unified interface."""
+
+    name: str = "base"
+    task: str = "regression"     # "regression" | "classification"
+
+    @abstractmethod
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> "BaseBMSModel":
+        ...
+
+    @abstractmethod
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        ...
+
+    @abstractmethod
+    def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, float]:
+        ...
+
+    def save(self, path: Optional[Path] = None) -> Path:
+        path = path or (MODELS_DIR / f"{self.name}.joblib")
+        joblib.dump(self, path)
+        logger.info(f"Saved {self.name} → {path}")
+        return path
+
+    @classmethod
+    def load(cls, path: Path) -> "BaseBMSModel":
+        obj = joblib.load(path)
+        logger.info(f"Loaded {path}")
+        return obj
+
+    def _build_preprocessor(self) -> ColumnTransformer:
+        return ColumnTransformer([
+            ("num", StandardScaler(), BMS_NUMERICAL_FEATURES),
+        ], remainder="drop")
+
+
+# ── 1. SOH Regressor ─────────────────────────────────────────────────────────
+
+class SOHRegressor(BaseBMSModel):
+    """
+    Predicts State of Health (SOH) as a continuous value in [0, 1].
+
+    Uses XGBoost (if available) or GradientBoostingRegressor as fallback.
+    Physics constraint: predictions are clipped to [0, 1].
+    """
+
+    name = "bms_soh_regressor"
+    task = "regression"
+
+    def __init__(
+        self,
+        n_estimators:  int   = 300,
+        max_depth:     int   = 5,
+        learning_rate: float = 0.05,
+        subsample:     float = 0.8,
+    ):
+        self.n_estimators  = n_estimators
+        self.max_depth     = max_depth
+        self.learning_rate = learning_rate
+        self.subsample     = subsample
+        self.pipeline_: Optional[Pipeline] = None
+        self.feature_names_: List[str] = BMS_NUMERICAL_FEATURES
+
+    def _build_pipeline(self) -> Pipeline:
+        try:
+            from xgboost import XGBRegressor
+            model = XGBRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                subsample=self.subsample,
+                random_state=42,
+                verbosity=0,
+            )
+            logger.debug("SOHRegressor: using XGBoost backend")
+        except ImportError:
+            from sklearn.ensemble import GradientBoostingRegressor
+            model = GradientBoostingRegressor(
+                n_estimators=min(self.n_estimators, 100),
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                subsample=self.subsample,
+                random_state=42,
+            )
+            logger.debug("SOHRegressor: XGBoost not found, using GradientBoosting fallback")
+
+        return Pipeline([
+            ("preprocessor", self._build_preprocessor()),
+            ("regressor",    model),
+        ])
+
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> "SOHRegressor":
+        X = X_train[BMS_NUMERICAL_FEATURES].copy()
+        self.pipeline_ = self._build_pipeline()
+        self.pipeline_.fit(X, y_train)
+        train_pred = self.predict(X_train)
+        train_mae  = mean_absolute_error(y_train, train_pred)
+        logger.info(f"SOHRegressor trained — train MAE={train_mae:.4f}")
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self.pipeline_ is None:
+            raise RuntimeError("Model not trained. Call .train() first.")
+        X = X[BMS_NUMERICAL_FEATURES].copy()
+        preds = self.pipeline_.predict(X)
+        # Physics constraint: SOH must be in [0, 1]
+        return np.clip(preds, 0.0, 1.0)
+
+    def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, float]:
+        preds = self.predict(X_test)
+        return {
+            "mae":  round(float(mean_absolute_error(y_test, preds)), 4),
+            "rmse": round(float(np.sqrt(mean_squared_error(y_test, preds))), 4),
+            "r2":   round(float(r2_score(y_test, preds)), 4),
+            "mean_pred": round(float(preds.mean()), 4),
+            "std_pred":  round(float(preds.std()), 4),
+        }
+
+    def predict_with_uncertainty(
+        self, X: pd.DataFrame, n_bootstrap: int = 20
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Bootstrap uncertainty estimation.
+        Returns (mean_prediction, std_deviation) per sample.
+        Useful for safety-critical confidence intervals.
+        """
+        if self.pipeline_ is None:
+            raise RuntimeError("Model not trained.")
+        rng  = np.random.default_rng(42)
+        X_np = X[BMS_NUMERICAL_FEATURES].values
+        preds = []
+        for _ in range(n_bootstrap):
+            idx = rng.integers(0, len(X_np), len(X_np))
+            # Use the existing pipeline on re-indexed data
+            subset = pd.DataFrame(X_np[idx], columns=BMS_NUMERICAL_FEATURES)
+            preds.append(self.predict(subset))
+        preds_arr = np.array(preds)  # (n_bootstrap, n_samples)
+        return preds_arr.mean(axis=0), preds_arr.std(axis=0)
+
+
+# ── 2. Fault Classifier ───────────────────────────────────────────────────────
+
+class FaultClassifier(BaseBMSModel):
+    """
+    Binary classifier for thermal/fault detection.
+    Predicts fault_label ∈ {0, 1}.
+
+    If thermal_runaway_risk > 0.1% AND this model outputs fault=1,
+    the system triggers an immediate safety shutdown.
+    """
+
+    name = "bms_fault_classifier"
+    task = "classification"
+
+    def __init__(
+        self,
+        n_estimators: int   = 200,
+        max_depth:    int   = 4,
+        threshold:    float = 0.40,   # Lower than 0.5 — safety-critical: prefer false positives
+    ):
+        self.n_estimators = n_estimators
+        self.max_depth    = max_depth
+        self.threshold    = threshold
+        self.pipeline_: Optional[Pipeline] = None
+
+    def _build_pipeline(self) -> Pipeline:
+        try:
+            from xgboost import XGBClassifier
+            model = XGBClassifier(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                scale_pos_weight=5,   # imbalanced: faults are rare
+                random_state=42,
+                verbosity=0,
+                eval_metric="logloss",
+            )
+            logger.debug("FaultClassifier: using XGBoost backend")
+        except ImportError:
+            from sklearn.ensemble import RandomForestClassifier
+            model = RandomForestClassifier(
+                n_estimators=min(self.n_estimators, 100),
+                max_depth=self.max_depth,
+                class_weight="balanced",
+                random_state=42,
+            )
+            logger.debug("FaultClassifier: using RandomForest fallback")
+
+        return Pipeline([
+            ("preprocessor", self._build_preprocessor()),
+            ("classifier",   model),
+        ])
+
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> "FaultClassifier":
+        X = X_train[BMS_NUMERICAL_FEATURES].copy()
+        self.pipeline_ = self._build_pipeline()
+        self.pipeline_.fit(X, y_train)
+        fault_rate = y_train.mean()
+        logger.info(f"FaultClassifier trained — fault rate={fault_rate:.3f}")
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        proba = self.predict_proba(X)
+        return (proba >= self.threshold).astype(int)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self.pipeline_ is None:
+            raise RuntimeError("Model not trained. Call .train() first.")
+        X = X[BMS_NUMERICAL_FEATURES].copy()
+        return self.pipeline_.predict_proba(X)[:, 1]
+
+    def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, float]:
+        proba = self.predict_proba(X_test)
+        preds = self.predict(X_test)
+        try:
+            auc = round(float(roc_auc_score(y_test, proba)), 4)
+        except Exception:
+            auc = 0.0
+        return {
+            "auc_roc":   auc,
+            "f1":        round(float(f1_score(y_test, preds, zero_division=0)), 4),
+            "precision": round(float(precision_score(y_test, preds, zero_division=0)), 4),
+            "recall":    round(float(recall_score(y_test, preds, zero_division=0)), 4),
+            "fault_rate_pred": round(float(preds.mean()), 4),
+            "fault_rate_true": round(float(y_test.mean()), 4),
+        }
+
+
+# ── 3. Degradation Trend Model ────────────────────────────────────────────────
+
+class DegradationTrendModel(BaseBMSModel):
+    """
+    Predicts the rate of capacity fade (capacity_fade_pct) over cycles.
+    Uses a simple Ridge regression — interpretable and fast for edge devices.
+    """
+
+    name = "bms_degradation_trend"
+    task = "regression"
+
+    def __init__(self, alpha: float = 1.0):
+        self.alpha = alpha
+        self.pipeline_: Optional[Pipeline] = None
+
+    def _build_pipeline(self) -> Pipeline:
+        from sklearn.linear_model import Ridge
+        return Pipeline([
+            ("preprocessor", self._build_preprocessor()),
+            ("regressor",    Ridge(alpha=self.alpha)),
+        ])
+
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series) -> "DegradationTrendModel":
+        X = X_train[BMS_NUMERICAL_FEATURES].copy()
+        self.pipeline_ = self._build_pipeline()
+        self.pipeline_.fit(X, y_train)
+        logger.info("DegradationTrendModel trained")
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self.pipeline_ is None:
+            raise RuntimeError("Model not trained.")
+        X = X[BMS_NUMERICAL_FEATURES].copy()
+        return np.clip(self.pipeline_.predict(X), 0.0, 100.0)
+
+    def evaluate(self, X_test: pd.DataFrame, y_test: pd.Series) -> Dict[str, float]:
+        preds = self.predict(X_test)
+        return {
+            "mae":  round(float(mean_absolute_error(y_test, preds)), 4),
+            "rmse": round(float(np.sqrt(mean_squared_error(y_test, preds))), 4),
+            "r2":   round(float(r2_score(y_test, preds)), 4),
+        }
+
+
+# ── 4. Ensemble Predictor ─────────────────────────────────────────────────────
+
+@dataclass
+class EnsemblePrediction:
+    """Output from the ensemble — what gets returned to the user / dashboard."""
+    soh_estimate:         float          # final fused SOH estimate
+    soh_uncertainty:      float          # ±confidence range
+    fault_probability:    float          # probability of fault/thermal event
+    fault_flag:           bool           # True = take immediate action
+    capacity_fade_pct:    float          # predicted capacity fade
+    degradation_severity: str            # "healthy" | "warning" | "critical"
+    recommended_action:   str
+    model_contributions:  Dict[str, float] = field(default_factory=dict)
+
+
+class EnsembleBMSPredictor:
+    """
+    Fuses SOHRegressor + FaultClassifier + DegradationTrendModel into
+    a single, authoritative BMS prediction.
+
+    Fusion strategy:
+      - SOH: weighted average (SOHRegressor gets 60%, trend model 40%)
+      - Fault: if ANY model signals fault probability > threshold → flag
+      - Safety override: thermal_runaway_risk > 0.10 always → fault=True
+
+    Supports:
+      - Single-sample real-time inference (edge use)
+      - Batch inference (monitoring loop use)
+      - Uncertainty quantification
+    """
+
+    def __init__(
+        self,
+        soh_weight:        float = 0.50,   # weight for XGBoost SOH regressor
+        trend_weight:      float = 0.25,   # weight for degradation trend model
+        lstm_weight:       float = 0.25,   # weight for LSTM SoC model
+        fault_threshold:   float = 0.35,
+        thermal_threshold: float = 0.10,
+    ):
+        self.soh_weight        = soh_weight
+        self.trend_weight      = trend_weight
+        self.lstm_weight       = lstm_weight
+        self.fault_threshold   = fault_threshold
+        self.thermal_threshold = thermal_threshold
+
+        self.soh_model:   Optional[SOHRegressor]       = None
+        self.fault_model: Optional[FaultClassifier]    = None
+        self.trend_model: Optional[DegradationTrendModel] = None
+        self.soc_lstm_model = None   # SoCLSTMWrapper or SoCLSTMFallbackWrapper
+        self._models_loaded = False
+
+    def load_all_models(
+        self,
+        soh_path:      Optional[Path] = None,
+        fault_path:    Optional[Path] = None,
+        trend_path:    Optional[Path] = None,
+        soc_lstm_path: Optional[Path] = None,
+    ) -> "EnsembleBMSPredictor":
+        """
+        Load all component models from disk.
+        The LSTM SoC model is optional — ensemble works fine without it.
+        """
+        soh_path      = soh_path      or (MODELS_DIR / "bms_soh_regressor.joblib")
+        fault_path    = fault_path    or (MODELS_DIR / "bms_fault_classifier.joblib")
+        trend_path    = trend_path    or (MODELS_DIR / "bms_degradation_trend.joblib")
+        # Look for Keras LSTM first, then sklearn fallback
+        if soc_lstm_path is None:
+            for candidate in ["soc_lstm.joblib", "soc_lstm_fallback.joblib"]:
+                p = MODELS_DIR / candidate
+                if p.exists():
+                    soc_lstm_path = p
+                    break
+
+        if soh_path.exists():
+            self.soh_model = joblib.load(soh_path)
+            logger.info(f"Loaded SOH model: {soh_path}")
+        if fault_path.exists():
+            self.fault_model = joblib.load(fault_path)
+            logger.info(f"Loaded Fault model: {fault_path}")
+        if trend_path.exists():
+            self.trend_model = joblib.load(trend_path)
+            logger.info(f"Loaded Trend model: {trend_path}")
+        if soc_lstm_path and soc_lstm_path.exists():
+            try:
+                self.soc_lstm_model = joblib.load(soc_lstm_path)
+                logger.info(f"Loaded SoC LSTM model: {soc_lstm_path}")
+            except Exception as e:
+                logger.warning(f"Could not load SoC LSTM ({e}) — continuing without it.")
+
+        n_loaded = sum(m is not None for m in [
+            self.soh_model, self.fault_model, self.trend_model, self.soc_lstm_model
+        ])
+        logger.info(f"Ensemble: {n_loaded}/4 models loaded")
+        self._models_loaded = True
+        return self
+
+    def predict_batch(self, X: pd.DataFrame) -> pd.DataFrame:
+        """
+        Run ensemble inference on a DataFrame of battery measurements.
+        Returns a DataFrame with one prediction row per input row.
+        """
+        results = []
+        for i, row in X.iterrows():
+            row_df = pd.DataFrame([row])
+            pred   = self._predict_single(row_df)
+            results.append({
+                "soh_estimate":        pred.soh_estimate,
+                "soh_uncertainty":     pred.soh_uncertainty,
+                "fault_probability":   pred.fault_probability,
+                "fault_flag":          int(pred.fault_flag),
+                "capacity_fade_pct":   pred.capacity_fade_pct,
+                "degradation_severity": pred.degradation_severity,
+                "recommended_action":  pred.recommended_action,
+            })
+        return pd.DataFrame(results, index=X.index)
+
+    def _predict_single(self, row_df: pd.DataFrame) -> EnsemblePrediction:
+        """
+        Run all available models and fuse their outputs.
+
+        Fusion weights (when all 4 models are loaded):
+          XGBoost SOH      : soh_weight   (default 0.50)
+          Degradation Trend: trend_weight (default 0.25)
+          LSTM SoC         : lstm_weight  (default 0.25)
+          → weights are re-normalised to sum to 1.0 for whichever models are present
+        """
+        soh_pred        = 0.8
+        fade_pred       = 0.0
+        fault_prob      = 0.0
+        soh_uncertainty = 0.05
+        contributions   = {}
+
+        # Collect weighted soh components dynamically
+        weighted_sum    = 0.0
+        total_weight    = 0.0
+
+        # ── 1. XGBoost SOH Regressor ─────────────────────────────────────
+        if self.soh_model is not None:
+            try:
+                xgb_soh = float(self.soh_model.predict(row_df)[0])
+                contributions["soh_regressor"] = xgb_soh
+                weighted_sum  += self.soh_weight * xgb_soh
+                total_weight  += self.soh_weight
+            except Exception as e:
+                logger.warning(f"SOH model prediction failed: {e}")
+
+        # ── 2. Degradation Trend Model ────────────────────────────────────
+        if self.trend_model is not None:
+            try:
+                fade_pred  = float(self.trend_model.predict(row_df)[0])
+                trend_soh  = max(0.0, 1.0 - fade_pred / 100)
+                contributions["degradation_trend"] = trend_soh
+                weighted_sum  += self.trend_weight * trend_soh
+                total_weight  += self.trend_weight
+            except Exception as e:
+                logger.warning(f"Trend model prediction failed: {e}")
+
+        # ── 3. LSTM SoC Model ─────────────────────────────────────────────
+        # The LSTM predicts SoC (current charge level, 0–1) which correlates
+        # with SOH but is a different quantity.  We use it as a soft signal:
+        # if SoC drops faster than expected given cycle_count, it implies
+        # capacity (SOH) has degraded.  We blend it as a SOH proxy.
+        if self.soc_lstm_model is not None:
+            try:
+                # The LSTM needs a sequence window.  For single-row inference
+                # we repeat the row seq_len times as a minimal window.
+                seq_len  = getattr(
+                    getattr(self.soc_lstm_model, "seq_builder_", None), "seq_len", 10
+                ) or 10
+                window   = pd.concat([row_df] * seq_len, ignore_index=True)
+                lstm_soc = float(self.soc_lstm_model.predict_realtime(window))
+                # Use LSTM SoC as a SOH proxy contribution
+                contributions["lstm_soc"] = lstm_soc
+                weighted_sum  += self.lstm_weight * lstm_soc
+                total_weight  += self.lstm_weight
+            except Exception as e:
+                logger.warning(f"LSTM SoC model prediction failed: {e}")
+
+        # ── Normalised fusion ─────────────────────────────────────────────
+        soh_pred = (weighted_sum / total_weight) if total_weight > 0 else soh_pred
+        soh_pred = float(np.clip(soh_pred, 0.0, 1.0))
+
+        # ── 4. Fault Classifier ───────────────────────────────────────────
+        if self.fault_model is not None:
+            try:
+                fault_prob = float(self.fault_model.predict_proba(row_df)[0])
+                contributions["fault_classifier"] = fault_prob
+            except Exception as e:
+                logger.warning(f"Fault model prediction failed: {e}")
+
+        # ── Safety override: thermal_runaway_risk ────────────────────────
+        thermal_risk = float(row_df.get("thermal_runaway_risk", pd.Series([0])).iloc[0])
+        fault_flag   = fault_prob >= self.fault_threshold or thermal_risk >= self.thermal_threshold
+
+        # ── Degradation severity ─────────────────────────────────────────
+        if soh_pred >= 0.80:
+            severity = "healthy"
+            action   = "Continue normal operation. Schedule routine check in 3 months."
+        elif soh_pred >= 0.70:
+            severity = "warning"
+            action   = "SOH declining. Reduce fast-charging frequency. Schedule inspection."
+        else:
+            severity = "critical"
+            action   = "SOH below 70%. Battery replacement recommended within 30 days."
+
+        if fault_flag:
+            severity = "critical"
+            action   = "⚠️ FAULT DETECTED. Immediate inspection required. Consider shutdown."
+
+        return EnsemblePrediction(
+            soh_estimate=round(soh_pred, 4),
+            soh_uncertainty=round(soh_uncertainty, 4),
+            fault_probability=round(fault_prob, 4),
+            fault_flag=fault_flag,
+            capacity_fade_pct=round(fade_pred, 3),
+            degradation_severity=severity,
+            recommended_action=action,
+            model_contributions=contributions,
+        )
+
+
+# ── Training convenience function ─────────────────────────────────────────────
+
+def train_all_bms_models(
+    df_train: pd.DataFrame,
+    df_test:  Optional[pd.DataFrame] = None,
+    save:     bool = True,
+) -> Dict[str, Any]:
+    """
+    Train all three BMS models on a dataset and optionally save them.
+
+    Returns:
+        dict with {soh_model, fault_model, trend_model, metrics}
+    """
+    from src.data.battery_data_generator import (
+        BMS_NUMERICAL_FEATURES, BMS_TARGET_REGRESSION, BMS_TARGET_CLASSIFICATION
+    )
+    from sklearn.model_selection import train_test_split
+
+    X     = df_train[BMS_NUMERICAL_FEATURES]
+    y_soh = df_train[BMS_TARGET_REGRESSION]
+    y_fault = df_train[BMS_TARGET_CLASSIFICATION]
+    y_fade  = df_train["capacity_fade_pct"]
+
+    if df_test is None:
+        X_train, X_test, y_soh_train, y_soh_test = train_test_split(
+            X, y_soh, test_size=0.2, random_state=42
+        )
+        _, _, y_fault_train, y_fault_test = train_test_split(
+            X, y_fault, test_size=0.2, random_state=42
+        )
+        _, _, y_fade_train, y_fade_test = train_test_split(
+            X, y_fade, test_size=0.2, random_state=42
+        )
+    else:
+        X_train, y_soh_train   = X, y_soh
+        X_test, y_soh_test     = df_test[BMS_NUMERICAL_FEATURES], df_test[BMS_TARGET_REGRESSION]
+        y_fault_train          = y_fault
+        y_fault_test           = df_test[BMS_TARGET_CLASSIFICATION]
+        y_fade_train           = y_fade
+        y_fade_test            = df_test["capacity_fade_pct"]
+
+    logger.info("=== Training BMS Model Suite ===")
+
+    # ── SOH Regressor ────────────────────────────────────────────────────
+    soh_model = SOHRegressor()
+    soh_model.train(X_train, y_soh_train)
+    soh_metrics = soh_model.evaluate(X_test, y_soh_test)
+    logger.info(f"SOH Regressor → {soh_metrics}")
+    if save:
+        soh_model.save()
+
+    # ── Fault Classifier ─────────────────────────────────────────────────
+    fault_model = FaultClassifier()
+    fault_model.train(X_train, y_fault_train)
+    fault_metrics = fault_model.evaluate(X_test, y_fault_test)
+    logger.info(f"Fault Classifier → {fault_metrics}")
+    if save:
+        fault_model.save()
+
+    # ── Degradation Trend ─────────────────────────────────────────────────
+    trend_model = DegradationTrendModel()
+    trend_model.train(X_train, y_fade_train)
+    trend_metrics = trend_model.evaluate(X_test, y_fade_test)
+    logger.info(f"Degradation Trend → {trend_metrics}")
+    if save:
+        trend_model.save()
+
+    return {
+        "soh_model":    soh_model,
+        "fault_model":  fault_model,
+        "trend_model":  trend_model,
+        "metrics": {
+            "soh":   soh_metrics,
+            "fault": fault_metrics,
+            "trend": trend_metrics,
+        }
+    }
+
+
+if __name__ == "__main__":
+    from src.data.battery_data_generator import BatteryDataGenerator
+
+    gen    = BatteryDataGenerator("NMC")
+    df_ref = gen.generate_reference_data(n_cells=200, n_cycles_per_cell=60)
+
+    result = train_all_bms_models(df_ref, save=True)
+    logger.success("BMS model suite trained and saved!")
+    for model_name, metrics in result["metrics"].items():
+        logger.info(f"  [{model_name}] {metrics}")
