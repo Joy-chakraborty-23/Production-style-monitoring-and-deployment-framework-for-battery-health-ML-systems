@@ -1,0 +1,378 @@
+"""
+battery_data_generator.py — Physics-Based Battery Management System Data Generator
+
+Simulates realistic battery telemetry data based on electrochemical principles:
+  - State of Health (SOH) degradation over charge/discharge cycles
+  - Temperature-dependent capacity fade (Arrhenius equation)
+  - Lithium plating effects at high C-rates
+  - Internal resistance growth (calendar + cycle aging)
+  - Thermal runaway risk modelling
+
+Battery chemistries supported:
+  - NMC  (Nickel Manganese Cobalt) — EVs
+  - LFP  (Lithium Iron Phosphate) — Grid storage / EVs
+  - NCA  (Nickel Cobalt Aluminium) — High-performance EVs
+
+Usage:
+    from src.data.battery_data_generator import BatteryDataGenerator
+    gen = BatteryDataGenerator(chemistry="NMC")
+    ref_df = gen.generate_reference_data(n_cells=200, n_cycles_per_cell=50)
+    batch  = gen.generate_production_batch(n_samples=500, batch_id=3, drift_type="thermal")
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Tuple, List
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+
+
+# ── Reproducibility ────────────────────────────────────────────────────────────
+RNG = np.random.default_rng(42)
+
+
+# ── Battery chemistry profiles ─────────────────────────────────────────────────
+CHEMISTRY_PROFILES = {
+    "NMC": {
+        "nominal_capacity_ah": 50.0,
+        "nominal_voltage":     3.7,
+        "max_voltage":         4.2,
+        "min_voltage":         2.8,
+        "max_temp_c":          45.0,
+        "cycle_life":          1000,
+        "calendar_fade_rate":  0.03,   # 3% per year at 25°C
+        "cycle_fade_rate":     0.0002, # % capacity lost per cycle
+        "resistance_growth":   0.0003, # mΩ per cycle
+    },
+    "LFP": {
+        "nominal_capacity_ah": 100.0,
+        "nominal_voltage":     3.2,
+        "max_voltage":         3.65,
+        "min_voltage":         2.5,
+        "max_temp_c":          55.0,
+        "cycle_life":          3000,
+        "calendar_fade_rate":  0.015,  # more stable chemistry
+        "cycle_fade_rate":     0.00008,
+        "resistance_growth":   0.00015,
+    },
+    "NCA": {
+        "nominal_capacity_ah": 65.0,
+        "nominal_voltage":     3.6,
+        "max_voltage":         4.18,
+        "min_voltage":         2.7,
+        "max_temp_c":          40.0,
+        "cycle_life":          500,
+        "calendar_fade_rate":  0.04,
+        "cycle_fade_rate":     0.0003,
+        "resistance_growth":   0.0005,
+    },
+}
+
+
+@dataclass
+class BatteryCell:
+    """Represents the state of a single battery cell."""
+    cell_id:          str
+    chemistry:        str
+    cycle_count:      int
+    soh:              float   # State of Health [0, 1]
+    soc:              float   # State of Charge  [0, 1]
+    temperature_c:    float
+    voltage:          float
+    current_a:        float
+    internal_resistance_mohm: float
+    charge_rate_c:    float   # C-rate during charging
+    calendar_age_days: int
+
+
+@dataclass
+class BatteryConfig:
+    chemistry:          str   = "NMC"
+    n_bins_psi:         int   = 10
+    thermal_drift_temp: float = 55.0   # °C — triggers thermal drift scenario
+    fast_charge_threshold: float = 1.5 # C-rate above which lithium plating risk rises
+
+
+# ── Main generator class ───────────────────────────────────────────────────────
+
+class BatteryDataGenerator:
+    """
+    Generates physics-informed battery telemetry for ML monitoring.
+
+    Key columns produced:
+        cell_id, cycle_count, soh, soc, voltage, current_a,
+        temperature_c, internal_resistance_mohm, charge_rate_c,
+        capacity_fade_pct, calendar_age_days, chemistry,
+        thermal_runaway_risk, fault_label (0/1)
+    """
+
+    def __init__(self, chemistry: str = "NMC"):
+        if chemistry not in CHEMISTRY_PROFILES:
+            raise ValueError(f"chemistry must be one of {list(CHEMISTRY_PROFILES)}")
+        self.chemistry = chemistry
+        self.profile   = CHEMISTRY_PROFILES[chemistry]
+        self.config    = BatteryConfig(chemistry=chemistry)
+        logger.info(f"BatteryDataGenerator initialised — chemistry={chemistry}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def generate_reference_data(
+        self,
+        n_cells:           int = 300,
+        n_cycles_per_cell: int = 100,
+        temp_mean_c:       float = 25.0,
+    ) -> pd.DataFrame:
+        """
+        Generate clean reference (training) data.
+        Covers the full healthy operating range of a new battery fleet.
+        """
+        logger.info(
+            f"Generating BMS reference data  "
+            f"n_cells={n_cells}  cycles_per_cell={n_cycles_per_cell}"
+        )
+        rows = []
+        for cell_idx in range(n_cells):
+            cell_id = f"{self.chemistry}_cell_{cell_idx:04d}"
+            # Stagger cycle counts so we cover the full lifecycle range
+            start_cycle = int(RNG.integers(0, max(1, self.profile["cycle_life"] // 4)))
+            for c in range(n_cycles_per_cell):
+                cycle = start_cycle + c
+                rows.append(self._simulate_measurement(cell_id, cycle, temp_mean_c))
+        df = pd.DataFrame(rows)
+        logger.info(
+            f"Reference SOH: mean={df['soh'].mean():.3f}  std={df['soh'].std():.3f}  "
+            f"fault_rate={df['fault_label'].mean():.3f}"
+        )
+        return df
+
+    def generate_production_batch(
+        self,
+        n_samples:       int = 500,
+        batch_id:        int = 0,
+        drift_type:      Optional[str] = None,
+        drift_intensity: float = 0.5,
+    ) -> pd.DataFrame:
+        """
+        Generate a production batch with optional drift injection.
+
+        drift_type options:
+            None        — clean batch (no drift)
+            "thermal"   — high-temperature operation (battery stress)
+            "aging"     — fleet is older, higher cycle counts
+            "fast_charge" — aggressive charging → lithium plating risk
+            "gradual"   — slow degradation worsening over batches
+            "sudden"    — sudden fault spike (e.g. temperature event)
+        """
+        effective = drift_intensity if drift_type != "gradual" \
+                    else min(drift_intensity * (batch_id / 10), drift_intensity)
+
+        temp_mean   = 25.0
+        cycle_shift = 0
+        c_rate_bias = 0.0
+
+        if drift_type == "thermal":
+            temp_mean   = 25.0 + 20 * effective
+        elif drift_type == "aging":
+            cycle_shift = int(self.profile["cycle_life"] * 0.4 * effective)
+        elif drift_type == "fast_charge":
+            c_rate_bias = 1.5 * effective
+        elif drift_type in ("gradual", "sudden"):
+            temp_mean   = 25.0 + 15 * effective
+            cycle_shift = int(self.profile["cycle_life"] * 0.25 * effective)
+            c_rate_bias = 0.8 * effective
+
+        rows = []
+        for i in range(n_samples):
+            cell_id = f"{self.chemistry}_prod_{batch_id:03d}_{i:04d}"
+            base_cycle = int(RNG.integers(0, self.profile["cycle_life"] // 2))
+            cycle = base_cycle + cycle_shift
+            rows.append(
+                self._simulate_measurement(
+                    cell_id, cycle,
+                    temp_mean_c=temp_mean,
+                    c_rate_bias=c_rate_bias,
+                )
+            )
+
+        df = pd.DataFrame(rows)
+        df["batch_id"]   = batch_id
+        df["drift_type"] = drift_type or "none"
+        return df
+
+    def generate_edge_snapshot(self, n_samples: int = 50) -> pd.DataFrame:
+        """
+        Lightweight snapshot for edge device inference.
+        Returns only the features needed for real-time SOH prediction.
+        """
+        batch = self.generate_production_batch(n_samples=n_samples)
+        edge_cols = [
+            "voltage", "current_a", "temperature_c",
+            "charge_rate_c", "internal_resistance_mohm",
+            "soc", "cycle_count",
+        ]
+        return batch[edge_cols + ["soh", "fault_label"]].copy()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Physics simulation (private)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _simulate_measurement(
+        self,
+        cell_id:      str,
+        cycle_count:  int,
+        temp_mean_c:  float = 25.0,
+        c_rate_bias:  float = 0.0,
+    ) -> dict:
+        """Simulate one telemetry measurement for a battery cell."""
+        profile = self.profile
+
+        # ── Temperature (Gaussian around operating mean) ───────────────────
+        temp_c = float(RNG.normal(temp_mean_c, 5.0))
+        temp_c = np.clip(temp_c, -10.0, 70.0)
+
+        # ── SOH: capacity fade = cycle aging + calendar aging + temp stress ─
+        cycle_fade    = cycle_count * profile["cycle_fade_rate"]
+        calendar_days = int(cycle_count * 1.5)  # rough estimate
+        calendar_fade = (calendar_days / 365) * profile["calendar_fade_rate"]
+        # Arrhenius: extra fade for high temperatures (activation energy ~0.3 eV)
+        temp_stress   = max(0, (temp_c - 25) / 10) * 0.015
+        soh = float(np.clip(1.0 - cycle_fade - calendar_fade - temp_stress, 0.0, 1.0))
+        # Add small measurement noise
+        soh += float(RNG.normal(0, 0.005))
+        soh  = float(np.clip(soh, 0.0, 1.0))
+
+        # ── Charge rate (C-rate) ───────────────────────────────────────────
+        c_rate = float(np.clip(
+            RNG.lognormal(-0.2, 0.4) + c_rate_bias, 0.1, 5.0
+        ))
+
+        # ── SOC: random point in charge/discharge cycle ────────────────────
+        soc = float(np.clip(RNG.uniform(0.10, 0.95), 0.0, 1.0))
+
+        # ── Voltage: OCV curve approximation (simplified for NMC-like) ──────
+        ocv       = profile["min_voltage"] + soc * (profile["max_voltage"] - profile["min_voltage"])
+        current_a = c_rate * profile["nominal_capacity_ah"] * soh
+        r_growth  = cycle_count * profile["resistance_growth"]
+        r_internal= float(np.clip(10.0 + r_growth + RNG.normal(0, 0.5), 5.0, 100.0))
+        voltage   = float(np.clip(ocv - (current_a * r_internal / 1000), 2.0, 4.5))
+
+        # ── Capacity fade % ────────────────────────────────────────────────
+        capacity_fade_pct = (1.0 - soh) * 100
+
+        # ── Thermal runaway risk ──────────────────────────────────────────
+        # Risk increases with: temp > threshold, low SOH, high C-rate
+        thermal_risk = (
+            max(0, (temp_c - profile["max_temp_c"]) / 20) * 0.5
+            + max(0, c_rate - 2.0) / 3.0 * 0.3
+            + max(0, (1.0 - soh) - 0.3) * 0.2
+        )
+        thermal_runaway_risk = float(np.clip(thermal_risk + RNG.normal(0, 0.01), 0.0, 1.0))
+
+        # ── Fault label (binary) ─────────────────────────────────────────
+        # Fault if: thermal risk > 0.1 OR SOH < 0.7 OR voltage anomaly
+        voltage_anomaly = voltage < profile["min_voltage"] or voltage > profile["max_voltage"]
+        fault_label     = int(
+            thermal_runaway_risk > 0.10
+            or soh < 0.70
+            or voltage_anomaly
+        )
+
+        return {
+            "cell_id":                    cell_id,
+            "chemistry":                  self.chemistry,
+            "cycle_count":                int(np.clip(cycle_count, 0, 9999)),
+            "calendar_age_days":          calendar_days,
+            "soh":                        round(soh, 4),
+            "soc":                        round(soc, 4),
+            "voltage":                    round(voltage, 4),
+            "current_a":                  round(current_a, 3),
+            "charge_rate_c":              round(c_rate, 3),
+            "temperature_c":              round(temp_c, 2),
+            "internal_resistance_mohm":   round(r_internal, 3),
+            "capacity_fade_pct":          round(capacity_fade_pct, 3),
+            "thermal_runaway_risk":       round(thermal_runaway_risk, 4),
+            "fault_label":                fault_label,
+        }
+
+
+# ── Feature schema ────────────────────────────────────────────────────────────
+
+BMS_NUMERICAL_FEATURES = [
+    "cycle_count", "soc", "voltage", "current_a",
+    "charge_rate_c", "temperature_c", "internal_resistance_mohm",
+    "capacity_fade_pct", "calendar_age_days",
+]
+BMS_CATEGORICAL_FEATURES = ["chemistry"]
+BMS_TARGET_REGRESSION    = "soh"              # regression target
+BMS_TARGET_CLASSIFICATION = "fault_label"     # classification target (thermal/fault)
+
+
+# ── Convenience functions ─────────────────────────────────────────────────────
+
+def generate_bms_reference(
+    chemistry: str = "NMC", n_cells: int = 300, n_cycles_per_cell: int = 100
+) -> pd.DataFrame:
+    return BatteryDataGenerator(chemistry).generate_reference_data(n_cells, n_cycles_per_cell)
+
+
+def generate_bms_batch(
+    chemistry: str = "NMC",
+    n_samples: int = 500,
+    batch_id: int = 0,
+    drift_type: Optional[str] = None,
+) -> pd.DataFrame:
+    return BatteryDataGenerator(chemistry).generate_production_batch(
+        n_samples, batch_id, drift_type
+    )
+
+
+def prepare_bms_train_test_split(
+    df: pd.DataFrame,
+    target: str = BMS_TARGET_REGRESSION,
+    test_size: float = 0.20,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    from sklearn.model_selection import train_test_split
+    feature_cols = BMS_NUMERICAL_FEATURES  # chemistry handled separately
+    X = df[feature_cols].copy()
+    y = df[target].copy()
+    return train_test_split(X, y, test_size=test_size, random_state=42)
+
+
+if __name__ == "__main__":
+    logger.info("=== Generating BMS Dataset Suite ===")
+    from pathlib import Path
+
+    out = Path("data")
+    out.mkdir(exist_ok=True)
+
+    for chem in ["NMC", "LFP", "NCA"]:
+        gen = BatteryDataGenerator(chem)
+        ref = gen.generate_reference_data(n_cells=200, n_cycles_per_cell=80)
+        ref.to_csv(out / f"bms_reference_{chem.lower()}.csv", index=False)
+        logger.info(f"  {chem} reference: {len(ref)} rows  SOH mean={ref['soh'].mean():.3f}")
+
+    # Production batches with drift
+    gen_nmc = BatteryDataGenerator("NMC")
+    batches = []
+    for i in range(4):
+        batches.append(gen_nmc.generate_production_batch(500, i, None))
+    for i in range(4, 8):
+        batches.append(gen_nmc.generate_production_batch(500, i, "gradual", 0.6))
+    batches.append(gen_nmc.generate_production_batch(500, 8, "thermal", 0.9))
+    for i in range(9, 12):
+        batches.append(gen_nmc.generate_production_batch(500, i, "aging", 0.7))
+
+    for i, b in enumerate(batches):
+        b.to_csv(out / f"bms_production_batch_{i:03d}.csv", index=False)
+
+    logger.success(f"Generated {len(batches)} BMS production batches")
