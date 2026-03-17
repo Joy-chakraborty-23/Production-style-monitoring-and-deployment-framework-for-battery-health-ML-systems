@@ -1,0 +1,87 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML Monitoring System — Docker Compose
+#
+# Services:
+#   app        — Runs the full monitoring loop (generate → train → monitor)
+#   dashboard  — Plotly Dash dashboard on port 8050
+#   mlflow     — MLflow tracking UI on port 5000
+#
+# Usage:
+#   docker-compose up --build          # build and run all services
+#   docker-compose up dashboard        # dashboard only (after app has run)
+#   docker-compose run app make test   # run tests in container
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  app:
+    build: .
+    container_name: ml_monitor_app
+    command: make run
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./mlruns:/app/mlruns
+      - ./reports:/app/reports
+    environment:
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - PYTHONPATH=/app
+    networks:
+      - mlmonitor
+
+  api:
+    build: .
+    container_name: ml_monitor_api
+    command: uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --workers 2
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    environment:
+      - PYTHONPATH=/app
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+    depends_on:
+      - app
+    networks:
+      - mlmonitor
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  dashboard:
+    build: .
+    container_name: ml_monitor_dashboard
+    command: python -m src.dashboard.dashboard
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./models:/app/models
+      - ./mlruns:/app/mlruns
+    environment:
+      - PYTHONPATH=/app
+    depends_on:
+      - app
+    networks:
+      - mlmonitor
+    restart: unless-stopped
+
+  mlflow:
+    build: .
+    container_name: ml_monitor_mlflow
+    command: mlflow ui --host 0.0.0.0 --port 5000 --backend-store-uri /app/mlruns
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/app/mlruns
+    networks:
+      - mlmonitor
+    restart: unless-stopped
+
+networks:
+  mlmonitor:
+    driver: bridge

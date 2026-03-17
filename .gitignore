@@ -1,0 +1,32 @@
+# Data & model artifacts (large files)
+data/
+models/
+mlruns/
+reports/
+
+# Environment
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+coverage.xml
+*.egg-info/
+dist/
+build/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# Docker
+*.log
