@@ -1,0 +1,222 @@
+"""
+tests/test_api_server.py — Unit tests for the FastAPI inference server
+
+Uses FastAPI's TestClient (no running server needed).
+
+Run:
+    pytest tests/test_api_server.py -v --tb=short
+"""
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest
+
+
+# ── Shared test payload ───────────────────────────────────────────────────────
+
+VALID_PAYLOAD = {
+    "tenure":                  24,
+    "monthly_charges":         65.0,
+    "total_charges":           1560.0,
+    "num_products":            2,
+    "num_support_calls":       1,
+    "avg_call_duration":       8.5,
+    "days_since_last_login":   10,
+    "data_usage_gb":           12.3,
+    "billing_amount_variance": 4.5,
+    "customer_lifetime_value": 4200.0,
+    "contract_type":           "One year",
+    "payment_method":          "Credit card",
+    "internet_service":        "Fiber optic",
+    "tech_support":            "Yes",
+    "online_security":         "Yes",
+    "paperless_billing":       "Yes",
+}
+
+HIGH_RISK_PAYLOAD = {
+    "tenure":                  3,
+    "monthly_charges":         95.0,
+    "total_charges":           285.0,
+    "num_products":            1,
+    "num_support_calls":       7,
+    "avg_call_duration":       18.0,
+    "days_since_last_login":   60,
+    "data_usage_gb":           4.1,
+    "billing_amount_variance": 22.0,
+    "customer_lifetime_value": 900.0,
+    "contract_type":           "Month-to-month",
+    "payment_method":          "Electronic check",
+    "internet_service":        "Fiber optic",
+    "tech_support":            "No",
+    "online_security":         "No",
+    "paperless_billing":       "Yes",
+}
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def client():
+    """
+    Create a TestClient with the server in a model-not-loaded state.
+    This tests the schema validation and routing logic without needing
+    a trained model on disk.
+    """
+    try:
+        from fastapi.testclient import TestClient
+        from src.api.server import app
+        return TestClient(app, raise_server_exceptions=False)
+    except Exception as e:
+        pytest.skip(f"FastAPI or uvicorn not installed: {e}")
+
+
+# ── Schema validation tests ───────────────────────────────────────────────────
+
+class TestInputSchema:
+    """Test that Pydantic validation catches bad inputs correctly."""
+
+    def test_invalid_contract_type_rejected(self, client):
+        bad = {**VALID_PAYLOAD, "contract_type": "Weekly"}
+        resp = client.post("/predict", json=bad)
+        assert resp.status_code == 422, "Invalid contract_type should return 422"
+
+    def test_invalid_payment_method_rejected(self, client):
+        bad = {**VALID_PAYLOAD, "payment_method": "Crypto"}
+        resp = client.post("/predict", json=bad)
+        assert resp.status_code == 422
+
+    def test_negative_tenure_rejected(self, client):
+        bad = {**VALID_PAYLOAD, "tenure": -5}
+        resp = client.post("/predict", json=bad)
+        assert resp.status_code == 422
+
+    def test_invalid_yes_no_field_rejected(self, client):
+        bad = {**VALID_PAYLOAD, "tech_support": "Maybe"}
+        resp = client.post("/predict", json=bad)
+        assert resp.status_code == 422
+
+    def test_missing_required_field_rejected(self, client):
+        bad = {k: v for k, v in VALID_PAYLOAD.items() if k != "tenure"}
+        resp = client.post("/predict", json=bad)
+        assert resp.status_code == 422
+
+    def test_all_valid_fields_accepted(self, client):
+        """A well-formed request should get past schema validation (may 503 if no model)."""
+        resp = client.post("/predict", json=VALID_PAYLOAD)
+        # 200 if model loaded, 503 if not — both are acceptable here
+        assert resp.status_code in (200, 503), f"Unexpected status {resp.status_code}"
+
+
+# ── Health endpoint ───────────────────────────────────────────────────────────
+
+class TestHealthEndpoint:
+    def test_health_returns_200(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+
+    def test_health_has_required_fields(self, client):
+        data = client.get("/health").json()
+        required = ["status", "model_loaded", "window_size", "predictions_served",
+                    "cpu_pct", "memory_pct", "uptime_seconds"]
+        for field in required:
+            assert field in data, f"Missing field: {field}"
+
+    def test_health_status_is_valid(self, client):
+        data = client.get("/health").json()
+        assert data["status"] in ("ok", "degraded")
+
+    def test_uptime_is_positive(self, client):
+        data = client.get("/health").json()
+        assert data["uptime_seconds"] >= 0
+
+
+# ── Metrics endpoint ──────────────────────────────────────────────────────────
+
+class TestMetricsEndpoint:
+    def test_metrics_returns_200(self, client):
+        resp = client.get("/metrics")
+        assert resp.status_code == 200
+
+    def test_metrics_has_status_field(self, client):
+        data = client.get("/metrics").json()
+        assert "status" in data
+        assert data["status"] in ("warming_up", "active")
+
+
+# ── Window stats endpoint ─────────────────────────────────────────────────────
+
+class TestWindowStatsEndpoint:
+    def test_window_stats_returns_200_when_empty(self, client):
+        resp = client.get("/window/stats")
+        assert resp.status_code == 200
+
+    def test_window_stats_has_status(self, client):
+        data = client.get("/window/stats").json()
+        assert "status" in data or "window_size" in data
+
+
+# ── Window reset endpoint ─────────────────────────────────────────────────────
+
+class TestWindowResetEndpoint:
+    def test_reset_returns_ok(self, client):
+        resp = client.delete("/window/reset")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+
+    def test_window_empty_after_reset(self, client):
+        client.delete("/window/reset")
+        health = client.get("/health").json()
+        assert health["window_size"] == 0
+        assert health["predictions_served"] == 0
+
+
+# ── Batch predict schema ──────────────────────────────────────────────────────
+
+class TestBatchPredictSchema:
+    def test_empty_batch_rejected(self, client):
+        resp = client.post("/predict/batch", json={"records": []})
+        assert resp.status_code == 422
+
+    def test_invalid_record_in_batch_rejected(self, client):
+        bad_record = {**VALID_PAYLOAD, "contract_type": "Invalid"}
+        resp = client.post("/predict/batch", json={"records": [bad_record]})
+        assert resp.status_code == 422
+
+    def test_valid_batch_reaches_model(self, client):
+        payload = {"records": [VALID_PAYLOAD, HIGH_RISK_PAYLOAD], "threshold": 0.5}
+        resp = client.post("/predict/batch", json=payload)
+        assert resp.status_code in (200, 503)
+
+
+# ── Risk level logic ──────────────────────────────────────────────────────────
+
+class TestRiskLevelLogic:
+    """Test the risk level helper directly — no model needed."""
+    def test_risk_level_thresholds(self):
+        from src.api.server import _risk_level
+        assert _risk_level(0.10) == "low"
+        assert _risk_level(0.39) == "low"
+        assert _risk_level(0.40) == "medium"
+        assert _risk_level(0.69) == "medium"
+        assert _risk_level(0.70) == "high"
+        assert _risk_level(0.99) == "high"
+
+
+# ── CustomerFeatures model ────────────────────────────────────────────────────
+
+class TestCustomerFeaturesModel:
+    def test_to_dataframe_has_correct_columns(self):
+        from src.api.server import CustomerFeatures
+        cf = CustomerFeatures(**VALID_PAYLOAD)
+        df = cf.to_dataframe()
+        from src.config import model_config
+        for col in model_config.numerical_features + model_config.categorical_features:
+            assert col in df.columns, f"Missing column: {col}"
+
+    def test_to_dataframe_has_one_row(self):
+        from src.api.server import CustomerFeatures
+        cf = CustomerFeatures(**VALID_PAYLOAD)
+        assert len(cf.to_dataframe()) == 1
