@@ -1,0 +1,251 @@
+"""
+alert_manager.py — Alert System for Drift & Performance Events
+
+Manages:
+  - Alert creation with severity levels (INFO / WARNING / CRITICAL)
+  - Cooldown to prevent alert storms
+  - Slack webhook notifications
+  - Alert log persistence
+  - Alert history for the dashboard
+"""
+
+import json
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+import requests
+try:
+    from loguru import logger
+except ImportError:
+    import logging as _logging
+    logger = _logging.getLogger(__name__)
+    logger.success = logger.info
+
+from src.config import alert_config, MODELS_DIR
+
+
+# ── Alert Data Class ─────────────────────────────────────────────────────────
+
+@dataclass
+class Alert:
+    alert_id:    str
+    batch_id:    int
+    severity:    str           # INFO | WARNING | CRITICAL
+    category:    str           # "drift" | "performance" | "retrain" | "data_quality"
+    title:       str
+    message:     str
+    timestamp:   str = field(default_factory=lambda: datetime.now().isoformat())
+    acknowledged: bool = False
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @property
+    def emoji(self) -> str:
+        return {"INFO": "ℹ️", "WARNING": "⚠️", "CRITICAL": "🔴"}.get(self.severity, "📊")
+
+    @property
+    def slack_color(self) -> str:
+        return {"INFO": "#36a64f", "WARNING": "#ffcc00", "CRITICAL": "#e01e5a"}.get(self.severity, "#cccccc")
+
+
+# ── Alert Manager ────────────────────────────────────────────────────────────
+
+class AlertManager:
+    """
+    Central alert hub. Called by drift detector and performance monitor.
+
+    Usage:
+        alert_mgr = AlertManager()
+        alert_mgr.fire(batch_id=5, severity="CRITICAL", category="drift",
+                       title="Feature drift detected",
+                       message="monthly_charges PSI=0.31 exceeds critical threshold")
+    """
+
+    def __init__(self, log_path: Path = None):
+        self.log_path = log_path or (MODELS_DIR / "alert_log.json")
+        self.alerts: List[Alert] = []
+        self._cooldown_tracker: dict = {}   # category → last alert timestamp
+
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        if self.log_path.exists():
+            try:
+                with open(self.log_path) as f:
+                    raw = json.load(f)
+                self.alerts = [Alert(**a) for a in raw]
+                logger.info(f"Loaded {len(self.alerts)} existing alerts")
+            except Exception as e:
+                logger.warning(f"Could not load alert log: {e}")
+
+    def fire(
+        self,
+        batch_id: int,
+        severity: str,
+        category: str,
+        title: str,
+        message: str,
+    ) -> Optional[Alert]:
+        """
+        Create and dispatch an alert, respecting cooldown per category.
+
+        Returns:
+            Alert if fired, None if suppressed by cooldown.
+        """
+        # ── Cooldown check ──────────────────────────────────────────────
+        cooldown_key = f"{category}_{severity}"
+        last_fired   = self._cooldown_tracker.get(cooldown_key, 0)
+        cooldown_sec = alert_config.alert_cooldown_minutes * 60
+
+        if time.time() - last_fired < cooldown_sec and severity != "CRITICAL":
+            logger.debug(f"Alert suppressed (cooldown): {title}")
+            return None
+
+        self._cooldown_tracker[cooldown_key] = time.time()
+
+        # ── Create alert ────────────────────────────────────────────────
+        alert_id = f"{category}_{batch_id}_{int(time.time())}"
+        alert = Alert(
+            alert_id=alert_id,
+            batch_id=batch_id,
+            severity=severity,
+            category=category,
+            title=title,
+            message=message,
+        )
+
+        self.alerts.append(alert)
+        self._save()
+        self._dispatch(alert)
+
+        logger.log(
+            "WARNING" if severity in ("WARNING", "CRITICAL") else "INFO",
+            f"[ALERT] [{severity}] {title}"
+        )
+        return alert
+
+    def _dispatch(self, alert: Alert) -> None:
+        """Send alert via configured channels."""
+        # Console (always)
+        print(f"\n{'='*60}")
+        print(f"{alert.emoji}  [{alert.severity}] {alert.title}")
+        print(f"   Batch: {alert.batch_id} | Category: {alert.category}")
+        print(f"   {alert.message}")
+        print(f"   Timestamp: {alert.timestamp}")
+        print(f"{'='*60}\n")
+
+        # Slack webhook (if configured)
+        if alert_config.slack_webhook_url:
+            self._send_slack(alert)
+
+    def _send_slack(self, alert: Alert) -> None:
+        """Send formatted Slack notification via webhook."""
+        payload = {
+            "attachments": [{
+                "color": alert.slack_color,
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": f"{alert.emoji} {alert.title}"
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Severity:*\n{alert.severity}"},
+                            {"type": "mrkdwn", "text": f"*Batch:*\n{alert.batch_id}"},
+                            {"type": "mrkdwn", "text": f"*Category:*\n{alert.category}"},
+                            {"type": "mrkdwn", "text": f"*Time:*\n{alert.timestamp}"},
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*Details:*\n```{alert.message}```"}
+                    }
+                ]
+            }]
+        }
+        try:
+            resp = requests.post(
+                alert_config.slack_webhook_url,
+                json=payload, timeout=5
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Slack alert failed: {resp.status_code} {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"Slack alert exception: {e}")
+
+    def _save(self) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "w") as f:
+            json.dump([a.to_dict() for a in self.alerts], f, indent=2)
+
+    def get_recent(self, n: int = 20) -> List[Alert]:
+        return sorted(self.alerts, key=lambda a: a.timestamp, reverse=True)[:n]
+
+    def get_by_severity(self, severity: str) -> List[Alert]:
+        return [a for a in self.alerts if a.severity == severity]
+
+    def get_summary(self) -> dict:
+        return {
+            "total":    len(self.alerts),
+            "critical": len(self.get_by_severity("CRITICAL")),
+            "warning":  len(self.get_by_severity("WARNING")),
+            "info":     len(self.get_by_severity("INFO")),
+        }
+
+
+# ── Convenience functions used by the monitoring loop ────────────────────────
+
+def fire_drift_alert(
+    alert_mgr: AlertManager,
+    batch_id: int,
+    severity: str,
+    drifted_features: list,
+    drift_score: float,
+) -> None:
+    title = f"Data drift detected — {len(drifted_features)} feature(s)"
+    message = (
+        f"Overall drift score: {drift_score:.4f}\n"
+        f"Drifted features: {', '.join(drifted_features[:5])}"
+        + (f" (+{len(drifted_features)-5} more)" if len(drifted_features) > 5 else "")
+    )
+    alert_mgr.fire(batch_id, severity.upper(), "drift", title, message)
+
+
+def fire_performance_alert(
+    alert_mgr: AlertManager,
+    batch_id: int,
+    severity: str,
+    auc: float,
+    f1: float,
+    reason: str = "",
+) -> None:
+    title = f"Model performance degradation — Batch {batch_id}"
+    message = f"AUC: {auc:.4f} | F1: {f1:.4f}"
+    if reason:
+        message += f"\nReason: {reason}"
+    alert_mgr.fire(batch_id, severity.upper(), "performance", title, message)
+
+
+def fire_retrain_alert(
+    alert_mgr: AlertManager,
+    batch_id: int,
+    promoted: bool,
+    old_auc: float,
+    new_auc: float,
+    reason: str,
+) -> None:
+    status   = "PROMOTED" if promoted else "REJECTED"
+    severity = "INFO" if promoted else "WARNING"
+    title    = f"Retraining complete — Model {status}"
+    message  = (
+        f"Old AUC: {old_auc:.4f} → New AUC: {new_auc:.4f}\n"
+        f"Decision: {reason}"
+    )
+    alert_mgr.fire(batch_id, severity, "retrain", title, message)
