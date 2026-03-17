@@ -1,0 +1,179 @@
+"""
+scripts/load_test.py — FastAPI Server Latency Benchmarker
+
+Measures p50, p95, p99 inference latency under concurrent load.
+Runs without Locust — just Python stdlib threading.
+
+Usage:
+    # Start server first:
+    uvicorn src.api.server:app --port 8000
+
+    # Then run the load test:
+    python scripts/load_test.py --url http://localhost:8000 --n 500 --workers 10
+"""
+
+import sys
+import json
+import time
+import argparse
+import threading
+import statistics
+from pathlib import Path
+from typing import List
+
+try:
+    import requests
+except ImportError:
+    print("Install requests:  pip install requests")
+    sys.exit(1)
+
+# ── Sample payload — a realistic high-risk customer record ───────────────────
+SAMPLE_PAYLOAD = {
+    "tenure":                  6,
+    "monthly_charges":         89.5,
+    "total_charges":           537.0,
+    "num_products":            1,
+    "num_support_calls":       5,
+    "avg_call_duration":       14.2,
+    "days_since_last_login":   42,
+    "data_usage_gb":           7.8,
+    "billing_amount_variance": 15.3,
+    "customer_lifetime_value": 2100.0,
+    "contract_type":           "Month-to-month",
+    "payment_method":          "Electronic check",
+    "internet_service":        "Fiber optic",
+    "tech_support":            "No",
+    "online_security":         "No",
+    "paperless_billing":       "Yes",
+}
+
+RESULTS: List[float] = []
+ERRORS:  List[str]   = []
+_lock = threading.Lock()
+
+
+def _single_request(url: str, session: requests.Session) -> None:
+    try:
+        t0   = time.perf_counter()
+        resp = session.post(f"{url}/predict", json=SAMPLE_PAYLOAD, timeout=10)
+        ms   = (time.perf_counter() - t0) * 1_000
+        if resp.status_code == 200:
+            with _lock:
+                RESULTS.append(ms)
+        else:
+            with _lock:
+                ERRORS.append(f"HTTP {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        with _lock:
+            ERRORS.append(str(e))
+
+
+def run_load_test(url: str, n_requests: int, n_workers: int) -> None:
+    print(f"\n{'═'*52}")
+    print(f"  ML Monitoring — FastAPI Load Test")
+    print(f"{'═'*52}")
+    print(f"  Target:    {url}/predict")
+    print(f"  Requests:  {n_requests}")
+    print(f"  Workers:   {n_workers}")
+    print(f"{'─'*52}")
+
+    # Health check first
+    try:
+        h = requests.get(f"{url}/health", timeout=5)
+        health = h.json()
+        print(f"  Model loaded:  {health.get('model_loaded', '?')}")
+        print(f"  Server status: {health.get('status', '?')}")
+    except Exception as e:
+        print(f"  ⚠  Could not reach {url}/health: {e}")
+        print(f"     Make sure the server is running:  uvicorn src.api.server:app --port 8000")
+        return
+
+    print(f"{'─'*52}")
+
+    # Batch requests across worker threads
+    session = requests.Session()
+    batch   = max(1, n_requests // n_workers)
+
+    def _worker(count: int):
+        s = requests.Session()
+        for _ in range(count):
+            _single_request(url, s)
+
+    t_start  = time.perf_counter()
+    threads  = []
+    per_worker = [batch] * n_workers
+    per_worker[-1] += n_requests - sum(per_worker)   # handle remainder
+
+    for count in per_worker:
+        t = threading.Thread(target=_worker, args=(count,))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
+    total_sec = time.perf_counter() - t_start
+
+    # Results
+    n_ok  = len(RESULTS)
+    n_err = len(ERRORS)
+
+    if not RESULTS:
+        print(f"\n  All {n_err} requests failed. Check server logs.")
+        for e in ERRORS[:5]:
+            print(f"    {e}")
+        return
+
+    RESULTS.sort()
+    p50  = round(statistics.median(RESULTS), 2)
+    p95  = round(RESULTS[int(len(RESULTS) * 0.95)], 2)
+    p99  = round(RESULTS[int(len(RESULTS) * 0.99)], 2)
+    mean = round(statistics.mean(RESULTS), 2)
+    mx   = round(max(RESULTS), 2)
+    mn   = round(min(RESULTS), 2)
+    rps  = round(n_ok / total_sec, 1)
+
+    print(f"\n  Results ({n_ok} ok, {n_err} errors)\n")
+    print(f"  {'Metric':<22} {'Value':>10}")
+    print(f"  {'─'*34}")
+    print(f"  {'Mean latency':<22} {mean:>9}ms")
+    print(f"  {'p50 (median)':<22} {p50:>9}ms")
+    print(f"  {'p95':<22} {p95:>9}ms")
+    print(f"  {'p99':<22} {p99:>9}ms")
+    print(f"  {'Max':<22} {mx:>9}ms")
+    print(f"  {'Min':<22} {mn:>9}ms")
+    print(f"  {'Throughput':<22} {rps:>8} req/s")
+    print(f"  {'Total time':<22} {round(total_sec, 2):>9}s")
+
+    # Thresholds (for interview discussion: typical SLAs)
+    print(f"\n  SLA check (typical production targets):")
+    print(f"    p50 < 10ms  : {'PASS' if p50 < 10  else 'FAIL'}")
+    print(f"    p95 < 50ms  : {'PASS' if p95 < 50  else 'FAIL'}")
+    print(f"    p99 < 200ms : {'PASS' if p99 < 200 else 'FAIL'}")
+
+    if n_err:
+        print(f"\n  First {min(n_err, 3)} errors:")
+        for e in ERRORS[:3]:
+            print(f"    {e}")
+
+    # Save results
+    out_path = Path("models") / "load_test_results.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump({
+            "url": url, "n_requests": n_requests, "n_workers": n_workers,
+            "n_ok": n_ok, "n_errors": n_err,
+            "mean_ms": mean, "p50_ms": p50, "p95_ms": p95,
+            "p99_ms": p99, "max_ms": mx, "min_ms": mn,
+            "throughput_rps": rps,
+        }, f, indent=2)
+    print(f"\n  Full results saved to {out_path}")
+    print(f"{'═'*52}\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Load test the FastAPI inference server")
+    parser.add_argument("--url",     default="http://localhost:8000", help="Server base URL")
+    parser.add_argument("--n",       type=int, default=200,            help="Total requests")
+    parser.add_argument("--workers", type=int, default=10,             help="Concurrent threads")
+    args = parser.parse_args()
+    run_load_test(args.url, args.n, args.workers)
